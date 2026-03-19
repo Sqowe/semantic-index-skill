@@ -1,0 +1,67 @@
+{
+  "schema_version": "1.0",
+  "embedding": {
+    "provider": "openrouter",
+    "api_key": null,
+    "model": "nomic-ai/nomic-embed-text-v1.5",
+    "dimensions": 768,
+    "batch_size": 50,
+    "query_prefix": "search_query: ",
+    "document_prefix": "search_document: ",
+    "max_retries": 3,
+    "retry_delay_seconds": 1.0
+  },
+  "chunking": {
+    "max_tokens": 512,
+    "overlap_tokens": 50,
+    "min_tokens": 20
+  },
+  "indexing": {
+    "file_extensions": [
+      ".py",
+      ".js",
+      ".ts",
+      ".tsx",
+      ".jsx",
+      ".go",
+      ".rs",
+      ".java",
+      ".c",
+      ".cpp",
+      ".h",
+      ".hpp",
+      ".rb",
+      ".php",
+      ".md",
+      ".mdx",
+      ".txt",
+      ".rst"
+    ],
+    "exclude_patterns": [
+      "node_modules/",
+      "venv/",
+      ".venv/",
+      "__pycache__/",
+      "dist/",
+      "build/",
+      ".git/",
+      ".index/",
+      "*.min.js",
+      "*.min.css",
+      "*.map",
+      "package-lock.json",
+      "yarn.lock",
+      "poetry.lock",
+      "*.pyc",
+      "*.pyo",
+      "*.so",
+      "*.dylib"
+    ],
+    "max_file_size_kb": 500,
+    "respect_gitignore": true
+  },
+  "search": {
+    "default_top_k": 10,
+    "default_threshold": 0.3
+  }
+}
