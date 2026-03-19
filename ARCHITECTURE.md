@@ -882,7 +882,7 @@ Note: The cache is invalidated entirely if the embedding model or dimensions cha
 | 1.9 | `build_index.py`: CLI orchestration script | 1 hr | ✅ Done |
 | 1.10 | `semantic_search.py`: CLI search script | 1 hr | ✅ Done |
 | 1.11 | `index_status.py`: CLI status script | 30 min | ✅ Done |
-| 1.12 | SKILL.md: finalize instructions | 1 hr | |
+| 1.12 | SKILL.md: finalize instructions | 1 hr | ✅ Done |
 | 1.13 | End-to-end testing on a real project | 2 hr | |
 
 **Total Phase 1: ~17 hours**
