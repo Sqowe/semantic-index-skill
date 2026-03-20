@@ -8,7 +8,7 @@ Instead of grep/glob for exact string matches, this skill lets you search code b
 
 1. Scans your project for supported files (code + markdown)
 2. Chunks files using AST-aware splitting (Tree-sitter for code, header-based for markdown)
-3. Embeds chunks via OpenRouter API (Nomic Embed Text v1.5 by default)
+3. Embeds chunks via the configured provider (BGE-M3 on OpenRouter by default)
 4. Stores embeddings locally in `.index/` (LanceDB format)
 5. Searches by cosine similarity against your natural language queries
 
@@ -100,8 +100,8 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `embedding.provider` | `"openrouter"` | Embedding backend (`"openrouter"` or `"huggingface"`) |
-| `embedding.model` | `"nomic-ai/nomic-embed-text-v1.5"` | Embedding model |
-| `embedding.dimensions` | `768` | Vector dimensionality |
+| `embedding.model` | `"BAAI/bge-m3"` | Embedding model |
+| `embedding.dimensions` | `1024` | Vector dimensionality |
 | `embedding.batch_size` | `50` | Texts per API call |
 | `chunking.max_tokens` | `512` | Max chunk size in tokens |
 | `chunking.overlap_tokens` | `50` | Overlap between adjacent chunks |
@@ -258,6 +258,70 @@ Output:
   "languages": {"python": 120, "typescript": 80, "markdown": 22}
 }
 ```
+
+## Using with AI Assistants
+
+This skill is designed to be used by AI assistants, not just from the terminal. The AI reads `SKILL.md`, understands when and how to run the scripts, and uses the JSON output to answer your questions.
+
+### Kiro
+
+Once the skill is installed at `~/.kiro/skills/semantic-index/`, Kiro automatically discovers it. You can then ask naturally:
+
+- "Index this project for semantic search"
+- "Search the codebase for how authentication works"
+- "Where is error handling implemented?"
+- "Find code related to database migrations"
+- "Check if the index is up to date"
+
+Kiro will run the appropriate script, parse the JSON output, and present the results in context. If the index doesn't exist yet, it will suggest creating one first.
+
+### Claude Code
+
+Add the skill to your Claude Code project by placing the `semantic-index/` directory in your project's skill path or referencing it globally. Then use prompts like:
+
+```
+Use the semantic-index skill to index this project, then search for
+"how does the payment processing flow work?"
+```
+
+```
+Run index_status.py to check if the index is stale, then re-index
+if needed and search for "where are API routes defined?"
+```
+
+```
+Search the semantic index for code related to "user session management"
+and show me the top 5 results with their file paths.
+```
+
+### Generic SKILL-Compatible Tools
+
+Any tool that supports the SKILL protocol can use this skill. The AI assistant:
+
+1. Reads `SKILL.md` for instructions on when and how to use the scripts
+2. Runs `setup.sh` on first use to install dependencies
+3. Calls `build_index.py` to create/update the index
+4. Calls `semantic_search.py` with natural language queries
+5. Calls `index_status.py` to check index health
+
+All scripts communicate via JSON on stdout, making them easy for any AI to parse and act on.
+
+### Example Workflow in Chat
+
+A typical conversation might look like:
+
+> **You:** "I need to understand how this project handles caching"
+>
+> **AI:** *runs `index_status.py` → index exists but 12 files are stale*
+> *runs `build_index.py` → re-indexes 12 changed files*
+> *runs `semantic_search.py --query "caching strategy and cache invalidation"`*
+>
+> "Based on the semantic search, caching is handled in three places:
+> 1. `src/cache/redis_client.py` — Redis connection and basic get/set operations
+> 2. `src/middleware/cache.py` — HTTP response caching middleware
+> 3. `src/services/user_cache.py` — User session cache with TTL..."
+
+The AI uses the search results as context to give you a grounded, accurate answer with specific file references.
 
 ## Exit Codes
 
