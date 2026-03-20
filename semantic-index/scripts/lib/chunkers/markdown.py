@@ -8,12 +8,12 @@ Sections exceeding max_tokens are split at paragraph boundaries.
 import re
 from bisect import bisect_right
 
-from .common import count_tokens, make_chunk_id
+from .common import count_tokens, get_tokenizer, make_chunk_id
 from ..config import Config
 from ..models import Chunk, ChunkType
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
 
 
 def chunk_markdown(
@@ -97,9 +97,21 @@ def chunk_markdown(
 
     # Convert sections to chunks, splitting large ones
     for start, end, header_path in sections:
-        section_text = "\n".join(lines[start:end + 1]).strip()
+        raw_section = "\n".join(lines[start:end + 1])
+        section_text = raw_section.strip()
         if not section_text:
             continue
+
+        # Recompute line numbers after stripping to avoid drift
+        raw_lines = raw_section.split("\n")
+        leading_lines = 0
+        for rl in raw_lines:
+            if rl.strip() == "":
+                leading_lines += 1
+            else:
+                break
+        adj_start = start + leading_lines
+        adj_end = adj_start + section_text.count("\n")
 
         token_count = count_tokens(section_text)
         path_titles = [t for _, t in header_path]
@@ -109,10 +121,10 @@ def chunk_markdown(
         if token_count <= max_tokens:
             if token_count >= min_tokens:
                 chunks.append(Chunk(
-                    id=make_chunk_id(file_path, section_text, start + 1),
+                    id=make_chunk_id(file_path, section_text, adj_start + 1),
                     file_path=file_path,
-                    start_line=start + 1,
-                    end_line=end + 1,
+                    start_line=adj_start + 1,
+                    end_line=adj_end + 1,
                     content=section_text,
                     chunk_type=ChunkType.MARKDOWN_SECTION,
                     language="markdown",
@@ -122,7 +134,7 @@ def chunk_markdown(
         else:
             # Split at paragraph boundaries (double newline)
             sub_chunks = _split_text_by_paragraphs(
-                section_text, start + 1, file_path, max_tokens, min_tokens, meta,
+                section_text, adj_start + 1, file_path, max_tokens, min_tokens, meta,
             )
             chunks.extend(sub_chunks)
 
@@ -196,6 +208,100 @@ def _split_text_by_paragraphs(
             current_parts = []
             current_tokens = 0
 
+        # If a single paragraph exceeds max_tokens, hard-split it by lines
+        if para_tokens > max_tokens:
+            para_lines = para_text.split("\n")
+            sub_parts: list[str] = []
+            sub_tokens = 0
+            sub_start_offset = para_offset
+            line_offset = para_offset  # running char offset per line
+
+            for pline in para_lines:
+                line_tokens = count_tokens(pline)
+
+                # Oversized single line — flush accumulator first, then split
+                if line_tokens > max_tokens:
+                    # Flush any accumulated sub_parts before handling the long line
+                    if sub_parts:
+                        chunk_text = "\n".join(sub_parts)
+                        tc = count_tokens(chunk_text)
+                        start_ln = _offset_to_line(sub_start_offset)
+                        end_ln = start_ln + chunk_text.count("\n")
+                        if tc >= min_tokens:
+                            chunks.append(Chunk(
+                                id=make_chunk_id(file_path, chunk_text, start_ln),
+                                file_path=file_path,
+                                start_line=start_ln,
+                                end_line=end_ln,
+                                content=chunk_text,
+                                chunk_type=ChunkType.MARKDOWN_SECTION,
+                                language="markdown",
+                                token_count=tc,
+                                metadata=metadata.copy(),
+                            ))
+                        sub_parts = []
+                        sub_tokens = 0
+
+                    # Hard-split the oversized line by token window
+                    line_pieces = _split_line_by_tokens(pline, max_tokens)
+                    line_start_ln = _offset_to_line(line_offset)
+                    for piece in line_pieces[:-1]:
+                        tc = count_tokens(piece)
+                        if tc >= min_tokens:
+                            chunks.append(Chunk(
+                                id=make_chunk_id(file_path, piece, line_start_ln),
+                                file_path=file_path,
+                                start_line=line_start_ln,
+                                end_line=line_start_ln,
+                                content=piece,
+                                chunk_type=ChunkType.MARKDOWN_SECTION,
+                                language="markdown",
+                                token_count=tc,
+                                metadata=metadata.copy(),
+                            ))
+                    # Last piece becomes the new accumulator
+                    if line_pieces:
+                        sub_start_offset = line_offset
+                        sub_parts = [line_pieces[-1]]
+                        sub_tokens = count_tokens(line_pieces[-1])
+                    line_offset += len(pline) + 1
+                    continue
+
+                # Check overflow using actual joined token count (includes \n separators)
+                if sub_parts:
+                    projected = count_tokens("\n".join(sub_parts) + "\n" + pline)
+                    if projected > max_tokens:
+                        chunk_text = "\n".join(sub_parts)
+                        tc = count_tokens(chunk_text)
+                        start_ln = _offset_to_line(sub_start_offset)
+                        end_ln = start_ln + chunk_text.count("\n")
+                        if tc >= min_tokens:
+                            chunks.append(Chunk(
+                                id=make_chunk_id(file_path, chunk_text, start_ln),
+                                file_path=file_path,
+                                start_line=start_ln,
+                                end_line=end_ln,
+                                content=chunk_text,
+                                chunk_type=ChunkType.MARKDOWN_SECTION,
+                                language="markdown",
+                                token_count=tc,
+                                metadata=metadata.copy(),
+                            ))
+                        sub_start_offset = line_offset
+                        sub_parts = []
+                        sub_tokens = 0
+
+                sub_parts.append(pline)
+                sub_tokens = count_tokens("\n".join(sub_parts))
+                line_offset += len(pline) + 1
+
+            # Remaining lines from oversized paragraph become the new accumulator
+            if sub_parts:
+                current_parts = ["\n".join(sub_parts)]
+                current_tokens = count_tokens(current_parts[0])
+                current_start_offset = sub_start_offset
+            continue
+
         current_parts.append(para_text)
         current_tokens += para_tokens
 
@@ -219,3 +325,38 @@ def _split_text_by_paragraphs(
             ))
 
     return chunks
+
+
+def _split_line_by_tokens(line: str, max_tokens: int) -> list[str]:
+    """Hard-split a single long line into pieces respecting max_tokens.
+
+    Uses tiktoken to split at exact token boundaries. Includes a
+    round-trip safety check to guarantee UTF-8 fidelity — if a token
+    slice doesn't decode cleanly, falls back to extending/shrinking
+    the window until the round-trip is valid.
+    """
+    enc = get_tokenizer()
+    tokens = enc.encode(line)
+    pieces: list[str] = []
+
+    i = 0
+    while i < len(tokens):
+        end = min(i + max_tokens, len(tokens))
+        token_slice = tokens[i:end]
+        decoded = enc.decode(token_slice)
+
+        # Round-trip check: ensure no corruption from mid-character splits
+        if enc.encode(decoded) != token_slice:
+            # Shrink window until round-trip is clean
+            while end > i + 1:
+                end -= 1
+                token_slice = tokens[i:end]
+                decoded = enc.decode(token_slice)
+                if enc.encode(decoded) == token_slice:
+                    break
+
+        if decoded:
+            pieces.append(decoded)
+        i = end
+
+    return pieces if pieces else [line]
