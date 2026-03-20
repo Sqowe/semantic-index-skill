@@ -59,7 +59,12 @@ semantic-index/
 │   ├── index_status.py               # CLI: show index health & stats
 │   └── lib/
 │       ├── __init__.py
-│       ├── chunker.py                # Code & markdown chunking logic
+│       ├── chunker.py                # Chunking dispatch (code / markdown / DITA)
+│       ├── chunkers/
+│       │   ├── __init__.py
+│       │   ├── code.py               # Tree-sitter AST-aware code chunking
+│       │   ├── markdown.py           # Header-based markdown chunking
+│       │   └── dita.py               # XML-aware DITA topic chunking (Phase 5)
 │       ├── embedder.py               # Provider factory + EmbeddingProvider ABC
 │       ├── providers/
 │       │   ├── __init__.py
@@ -386,9 +391,11 @@ Algorithm:
 
 ### 4.5 chunker.py — AST-Aware Chunking
 
-This is the most complex module. It handles two distinct strategies:
+This is the most complex module. It dispatches to specialized chunkers based on
+file type, with a fallback for unrecognized formats. Strategy-specific logic lives
+in `lib/chunkers/` submodules; `chunker.py` handles dispatch and shared utilities.
 
-**Code files (via Tree-sitter):**
+**Strategy 1 — Code files (via Tree-sitter) → `chunkers/code.py`:**
 1. Parse file with Tree-sitter grammar for the detected language
 2. Extract top-level nodes: functions, classes, methods
 3. For each node:
@@ -398,17 +405,37 @@ This is the most complex module. It handles two distinct strategies:
 4. Remaining module-level code (imports, constants, top-level statements) → one "module_level" chunk
 5. Each chunk includes `chunk_overlap_tokens` of context from the previous chunk
 
-**Markdown files:**
+**Strategy 2 — Markdown files → `chunkers/markdown.py`:**
 1. Split on headers (# , ## , ### , etc.)
 2. Each section (header + content until next same-or-higher-level header) = one chunk
 3. Frontmatter (YAML between `---` delimiters) = separate chunk
 4. If a section exceeds `chunk_max_tokens`, split at paragraph boundaries
 5. Each chunk inherits parent headers as metadata for context
 
-**Fallback (unsupported languages):**
+**Strategy 3 — DITA XML files → `chunkers/dita.py` (Phase 5):**
+1. Parse XML via `xml.etree.ElementTree` (stdlib, no extra deps)
+2. Detect topic type from root element (`<topic>`, `<concept>`, `<task>`, `<reference>`,
+   `<glossentry>`, `<troubleshooting>`) or via DITA `class` attribute fallback
+3. Extract `<prolog>` metadata (keywords, audience, category) as chunk context
+4. Each topic = one chunk: `<title>` + `<shortdesc>` + body text (tags stripped)
+5. If a topic exceeds `chunk_max_tokens`, split at `<section>` boundaries
+6. For `.ditamap` files: walk `<topicref>` hierarchy → one "map overview" chunk
+7. Propagate `xml:lang` attributes as chunk metadata for multilingual indexing
+8. Note `conref`/`conkeyref` in metadata (not resolved; source file indexed separately)
+
+**Fallback (unsupported formats):**
 - Split on blank-line-separated blocks
 - Respect `chunk_max_tokens` limit
 - Mark as `ChunkType.UNKNOWN`
+
+**Dispatch logic in `chunker.py`:**
+
+| File Extension | Strategy | Chunker Module |
+|---------------|----------|----------------|
+| `.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.c`, `.cpp`, `.rb`, `.php`, etc. | Tree-sitter AST | `chunkers/code.py` |
+| `.md`, `.mdx`, `.rst` | Header-based | `chunkers/markdown.py` |
+| `.dita`, `.ditamap` | XML topic-based | `chunkers/dita.py` |
+| `.txt` and others | Fallback | `chunker.py` (inline) |
 
 **Supported languages (Tree-sitter, Phase 1):**
 Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby, PHP
@@ -721,7 +748,8 @@ Output (stdout, JSON):
       ".py", ".js", ".ts", ".tsx", ".jsx",
       ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
       ".rb", ".php",
-      ".md", ".mdx", ".txt", ".rst"
+      ".md", ".mdx", ".txt", ".rst",
+      ".dita", ".ditamap"
     ],
     "exclude_patterns": [
       "node_modules/", "venv/", ".venv/", "__pycache__/",
@@ -1140,25 +1168,80 @@ These are only installed when using the `huggingface` provider. The core
   should print a progress message to stderr: `"Downloading model nomic-ai/nomic-embed-text-v1.5 (~274MB)..."`.
 - After download, model loads from disk cache in 2-5 seconds.
 
-### Phase 5: Additional Providers (Optional)
+### Phase 5: DITA Documentation Support
+
+**Goal**: Add first-class support for indexing DITA XML documentation alongside code and Markdown.
+
+DITA (Darwin Information Typing Architecture) is an OASIS open standard for structured
+technical documentation. Files are XML with predictable topic-based structure, making them
+well-suited for semantic chunking — each topic covers a single subject by design.
+
+| Step | Task | Details |
+|------|------|---------|
+| 5.1 | Create `lib/chunkers/dita.py` | XML-aware DITA parser using Python's built-in `xml.etree.ElementTree`. No external dependencies needed. |
+| 5.2 | Register DITA file extensions | Add `.dita` and `.ditamap` to default `file_extensions` in config and to chunker dispatch logic. |
+| 5.3 | Implement topic-level chunking | Split on `<topic>`, `<concept>`, `<task>`, `<reference>`, `<glossentry>`, `<troubleshooting>` boundaries. Each topic = one chunk (unless it exceeds `chunk_max_tokens`). |
+| 5.4 | Extract `<prolog>` metadata | Parse `<keywords>`, `<audience>`, `<category>`, `<author>` from `<prolog>` elements. Prepend as context to chunk text to enrich embedding quality (e.g., `[audience: admin] [keywords: installation, upgrade] ...`). |
+| 5.5 | Implement section-level splitting | When a single topic exceeds `chunk_max_tokens`, split at `<section>` boundaries within `<body>` / `<taskbody>` / `<conbody>` / `<refbody>`. Preserve parent `<title>` as context in each sub-chunk. |
+| 5.6 | Implement XML text extraction | Strip XML tags for embedding text while preserving original XML in the stored chunk. Concatenate text from `<title>`, `<shortdesc>`, `<p>`, `<li>`, `<step>`, `<cmd>`, `<codeblock>`, `<note>`, etc. Maintain natural reading order. |
+| 5.7 | Handle `.ditamap` files | Parse `<topicref>` hierarchy to extract navigation structure, topic titles, and `navtitle` attributes. Index as a single "map overview" chunk per ditamap — useful for queries like "where is the installation guide?" |
+| 5.8 | Handle DITA specializations | Custom topic types (industry-specific) extend the base `<topic>` element. Use generic `<topic>` detection as fallback — if the root or any descendant matches `<topic>` or has `class` attribute containing `topic/topic`, treat it as a topic. |
+| 5.9 | Handle `xml:lang` propagation | DITA supports `xml:lang` at any element level, inherited by children. Extract and store language info as chunk metadata. Pair with multilingual embedding model (BGE-M3) for cross-lingual DITA search. |
+| 5.10 | Handle content references (conref) | For MVP: index raw file content without resolving conrefs. The referenced text will be indexed from its source file. Add a note in chunk metadata when `conref` or `conkeyref` attributes are detected, so search results can indicate partial content. |
+| 5.11 | Update `references/supported-languages.md` | Add DITA section documenting supported topic types, recognized elements, and chunking behavior. |
+| 5.12 | Test with real DITA content | Validate with concept, task, reference, and glossary entry topics. Verify ditamap indexing. Test multilingual DITA sets with `xml:lang` attributes. |
+
+**Chunking strategy summary for `dita.py`:**
+
+```
+.dita file
+  └── Parse XML tree
+       ├── Extract <prolog> metadata (keywords, audience, category)
+       ├── For each <topic>/<concept>/<task>/<reference>:
+       │    ├── title + shortdesc + body text → chunk text
+       │    ├── If under chunk_max_tokens → one chunk
+       │    ├── If over → split at <section> boundaries
+       │    └── Attach prolog metadata + xml:lang as chunk metadata
+       └── Mark conref/conkeyref references in metadata (not resolved)
+
+.ditamap file
+  └── Parse XML tree
+       ├── Walk <topicref> hierarchy
+       ├── Extract navtitle / href / keys for each reference
+       └── One "map overview" chunk with full navigation structure
+```
+
+**DITA elements to extract text from (in order):**
+
+`<title>`, `<shortdesc>`, `<abstract>`, `<p>`, `<li>`, `<sli>`, `<dt>`, `<dd>`,
+`<note>`, `<section>`, `<example>`, `<step>`, `<cmd>`, `<info>`, `<stepresult>`,
+`<result>`, `<prereq>`, `<context>`, `<codeblock>`, `<screen>`, `<msgblock>`,
+`<fig>/<title>`, `<table>/<title>`, `<entry>` (table cells), `<stentry>`.
+
+**DITA elements to skip (structural/metadata only):**
+
+`<prolog>` (extracted separately), `<related-links>`, `<link>`, `<topicmeta>` (in maps),
+`<navref>`, `<anchor>`, `<data>`, `<data-about>`, `<foreign>`, `<unknown>`.
+
+### Phase 6: Additional Providers (Optional)
 
 **Goal**: Add more provider options for flexibility.
 
 | Step | Task |
 |------|------|
-| 5.1 | Implement `OllamaProvider` (local Ollama REST API at `localhost:11434`) |
-| 5.2 | Implement `OpenAIProvider` (direct OpenAI API, no OpenRouter middleman) |
-| 5.3 | Provider auto-detection from model name patterns (e.g., `openai/...` → OpenAI) |
+| 6.1 | Implement `OllamaProvider` (local Ollama REST API at `localhost:11434`) |
+| 6.2 | Implement `OpenAIProvider` (direct OpenAI API, no OpenRouter middleman) |
+| 6.3 | Provider auto-detection from model name patterns (e.g., `openai/...` → OpenAI) |
 
-### Phase 6: MCP Bridge (Optional)
+### Phase 7: MCP Bridge (Optional)
 
 **Goal**: Expose the same indexing/search as an MCP server for tools that prefer MCP.
 
 | Step | Task |
 |------|------|
-| 5.1 | Wrap `build_index.py` / `semantic_search.py` / `index_status.py` as MCP tools |
-| 5.2 | Add FastMCP server entry point |
-| 5.3 | Keep the SKILL as the primary interface; MCP is an alternative transport |
+| 7.1 | Wrap `build_index.py` / `semantic_search.py` / `index_status.py` as MCP tools |
+| 7.2 | Add FastMCP server entry point |
+| 7.3 | Keep the SKILL as the primary interface; MCP is an alternative transport |
 
 ---
 
