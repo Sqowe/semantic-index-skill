@@ -1088,12 +1088,42 @@ Note: The cache is invalidated entirely if the embedding model or dimensions cha
 | 1.10 | `semantic_search.py`: CLI search script | 1 hr | ✅ Done |
 | 1.11 | `index_status.py`: CLI status script | 30 min | ✅ Done |
 | 1.12 | SKILL.md: finalize instructions | 1 hr | ✅ Done |
-| 1.13 | End-to-end testing on a real project | 2 hr | |
-| 1.14 | Batch-commit indexing for large repos (memory optimization) | 2 hr | |
+| 1.13 | End-to-end testing on a real project | 2 hr | ✅ Done |
+| 1.14 | Refactor `chunker.py` into `lib/chunkers/` subpackage (`code.py`, `markdown.py`, fallback in `chunker.py` dispatch) | 2 hr | |
+| 1.15 | Batch-commit indexing for large repos (memory optimization) | 2 hr | |
 
-**Total Phase 1: ~19 hours**
+**Total Phase 1: ~21 hours**
 
-**Step 1.14 — Batch-commit indexing for large repos:**
+**Step 1.14 — Refactor chunker.py into subpackage:**
+
+The current `chunker.py` is ~979 lines — over 3× the 300-line module limit
+from `AI_SKILL.md`. Before adding more chunking strategies (Phase 2 language
+expansion, Phase 5 DITA), split it into the architecture's intended structure:
+
+```
+lib/
+├── chunker.py              # Dispatch logic, shared utilities, fallback chunker (~150 lines)
+└── chunkers/
+    ├── __init__.py
+    ├── code.py             # Tree-sitter AST-aware code chunking (~350 lines)
+    └── markdown.py         # Header-based markdown chunking (~200 lines)
+```
+
+- `chunker.py` keeps the public `chunk_file()` function, `_detect_language()`,
+  `_make_chunk_id()`, `_count_tokens()`, `_get_tokenizer()`, and the fallback
+  `_chunk_text_fallback()`.
+- `chunkers/code.py` gets all Tree-sitter logic: `_get_parser()`, `_get_ts_language()`,
+  `_chunk_code_with_treesitter()`, `_chunk_class_node()`, `_split_oversized_chunk()`,
+  `EXTRACTABLE_NODES`, `METHOD_NODES`, etc.
+- `chunkers/markdown.py` gets `_chunk_markdown()`, `_split_text_by_paragraphs()`,
+  `_HEADER_RE`, `_FRONTMATTER_RE`.
+- Shared helpers (`_make_chunk_id`, `_count_tokens`, `_split_oversized_chunk`) are
+  imported from `chunker.py` by the submodules.
+
+No behavioral changes — pure structural refactor. All existing tests (if any)
+should pass without modification.
+
+**Step 1.15 — Batch-commit indexing for large repos:**
 
 The current `build_index.py` accumulates all chunks in memory, embeds them all,
 then commits to LanceDB in one atomic write. This guarantees index integrity
@@ -1166,8 +1196,8 @@ OpenRouter, enabling zero-cost, offline, low-latency indexing and search.
 | 4.4 | Create `create_embedder()` factory in `embedder.py` | Reads `config.embedding.provider`, lazy-imports the right provider |
 | 4.5 | Implement `HuggingFaceProvider` in `providers/huggingface.py` | sentence-transformers `SentenceTransformer.encode()`, auto device detection |
 | 4.6 | Create `requirements-huggingface.txt` | `sentence-transformers>=3.0.0`, `torch>=2.0.0` |
-| 4.7 | Update `setup.sh` to handle optional deps | Detect provider from config or `--with-huggingface` flag, install extras only when needed |
-| 4.8 | Update `config.py` to support `SEMANTIC_INDEX_PROVIDER` env var | Env var override for provider selection |
+| 4.7 | Update `setup.sh` to handle optional deps | Add `--with-huggingface` flag and auto-detect provider from existing `.index/config.json`. Current `setup.sh` only installs core deps — it has no HuggingFace awareness. |
+| 4.8 | Add `SEMANTIC_INDEX_PROVIDER` env var override in `config.py` | Currently not implemented. Add to `_apply_env_overrides()` so env var overrides `config.embedding.provider`. |
 | 4.9 | Update `build_index.py` and `semantic_search.py` | Replace `Embedder(config)` with `create_embedder(config)` |
 | 4.10 | Add `device` field to config schema and `Config` class | `null` (auto), `"cpu"`, `"cuda"`, `"mps"` |
 | 4.11 | Test: same model produces identical vectors via both providers | Index with OpenRouter, search with HuggingFace (and vice versa) |
