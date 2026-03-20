@@ -3,11 +3,11 @@
   "embedding": {
     "provider": "openrouter",
     "api_key": null,
-    "model": "nomic-ai/nomic-embed-text-v1.5",
-    "dimensions": 768,
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
     "batch_size": 50,
-    "query_prefix": "search_query: ",
-    "document_prefix": "search_document: ",
+    "query_prefix": "",
+    "document_prefix": "",
     "max_retries": 3,
     "retry_delay_seconds": 1.0
   },

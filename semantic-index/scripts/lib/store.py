@@ -215,13 +215,15 @@ class VectorStore:
 
         total = table.count_rows()
 
-        # Get language breakdown
+        # Get language breakdown using PyArrow (no pandas dependency)
         languages: dict[str, int] = {}
         try:
-            df = table.to_pandas()
-            if "language" in df.columns:
-                counts = df["language"].value_counts()
-                languages = {lang: int(count) for lang, count in counts.items() if lang}
+            arrow_table = table.to_arrow()
+            lang_col = arrow_table.column("language")
+            for val in lang_col:
+                lang = val.as_py()
+                if lang:
+                    languages[lang] = languages.get(lang, 0) + 1
         except Exception as exc:
             logger.warning("Failed to compute language stats: %s", exc)
 

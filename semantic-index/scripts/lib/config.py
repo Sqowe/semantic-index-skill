@@ -25,11 +25,11 @@ class EmbeddingConfig:
 
     provider: str = "openrouter"
     api_key: Optional[str] = None
-    model: str = "nomic-ai/nomic-embed-text-v1.5"
-    dimensions: int = 768
+    model: str = "BAAI/bge-m3"
+    dimensions: int = 1024
     batch_size: int = 50
-    query_prefix: str = "search_query: "
-    document_prefix: str = "search_document: "
+    query_prefix: str = ""
+    document_prefix: str = ""
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
 
