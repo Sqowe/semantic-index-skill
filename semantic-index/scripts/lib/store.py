@@ -218,10 +218,9 @@ class VectorStore:
         # Get language breakdown using PyArrow (no pandas dependency)
         languages: dict[str, int] = {}
         try:
-            arrow_table = table.to_arrow()
+            arrow_table = table.to_arrow().select(["language"])
             lang_col = arrow_table.column("language")
-            for val in lang_col:
-                lang = val.as_py()
+            for lang in lang_col.to_pylist():
                 if lang:
                     languages[lang] = languages.get(lang, 0) + 1
         except Exception as exc:

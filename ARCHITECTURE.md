@@ -1089,8 +1089,34 @@ Note: The cache is invalidated entirely if the embedding model or dimensions cha
 | 1.11 | `index_status.py`: CLI status script | 30 min | ✅ Done |
 | 1.12 | SKILL.md: finalize instructions | 1 hr | ✅ Done |
 | 1.13 | End-to-end testing on a real project | 2 hr | |
+| 1.14 | Batch-commit indexing for large repos (memory optimization) | 2 hr | |
 
-**Total Phase 1: ~17 hours**
+**Total Phase 1: ~19 hours**
+
+**Step 1.14 — Batch-commit indexing for large repos:**
+
+The current `build_index.py` accumulates all chunks in memory, embeds them all,
+then commits to LanceDB in one atomic write. This guarantees index integrity
+(if embedding fails, the old index stays intact) but consumes significant memory
+on large repos (e.g., 8K chunks × 1024 dims × 4 bytes = ~32MB vectors alone,
+plus all content strings).
+
+The improvement: process files in batches of 50-100 files at a time:
+
+1. Chunk a batch of files
+2. Embed the batch
+3. Delete old chunks for those files from the store
+4. Commit the new chunks to LanceDB
+5. Repeat for the next batch
+6. Update the manifest only after all batches succeed
+
+If a failure occurs mid-way, the manifest won't reflect uncommitted files,
+so the next `build_index.py` run re-processes them. The tradeoff is a
+potentially partially-updated index on failure (some files at new version,
+some at old), but `--full` re-index always recovers to a clean state.
+
+Peak memory drops from O(all_chunks) to O(batch_size_chunks), making
+10K+ file monorepos viable without OOM risk.
 
 **Dependencies (requirements.txt):**
 ```
