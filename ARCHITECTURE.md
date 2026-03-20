@@ -1089,7 +1089,7 @@ Note: The cache is invalidated entirely if the embedding model or dimensions cha
 | 1.11 | `index_status.py`: CLI status script | 30 min | ✅ Done |
 | 1.12 | SKILL.md: finalize instructions | 1 hr | ✅ Done |
 | 1.13 | End-to-end testing on a real project | 2 hr | ✅ Done |
-| 1.14 | Refactor `chunker.py` into `lib/chunkers/` subpackage (`code.py`, `markdown.py`, fallback in `chunker.py` dispatch) | 2 hr | |
+| 1.14 | Refactor `chunker.py` into `lib/chunkers/` subpackage (`code.py`, `markdown.py`, fallback in `chunker.py` dispatch) | 2 hr | ✅ Done |
 | 1.15 | Batch-commit indexing for large repos (memory optimization) | 2 hr | |
 
 **Total Phase 1: ~21 hours**
