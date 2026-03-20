@@ -17,21 +17,68 @@ The `.index/` directory is local, gitignoreable, and fully rebuildable. No serve
 ## Prerequisites
 
 - Python 3.10+
+- Git
 - An [OpenRouter](https://openrouter.ai/) API key (for the default embedding provider)
+
+## Getting the Skill
+
+Clone this repository and copy the `semantic-index/` directory to your Kiro skills folder:
+
+```bash
+# Clone the repo
+git clone <repo-url> /tmp/semantic-index-skill
+
+# Copy the skill into Kiro's skills directory
+cp -r /tmp/semantic-index-skill/semantic-index ~/.kiro/skills/semantic-index
+```
+
+After this, your skill directory should look like:
+
+```
+~/.kiro/skills/semantic-index/
+├── SKILL.md
+├── assets/
+│   └── default-config.json
+└── scripts/
+    ├── setup.sh
+    ├── requirements.txt
+    ├── build_index.py
+    ├── semantic_search.py
+    ├── index_status.py
+    └── lib/
+        └── ... (Python modules)
+```
+
+> You can place the skill anywhere you like. The examples below use `~/.kiro/skills/semantic-index` as the skill path. Adjust if you chose a different location.
+
+### How Skill vs. Index Directories Work
+
+The skill is installed once globally (e.g., `~/.kiro/skills/semantic-index/`) and stays read-only during normal use. The `.index/` directory — containing config, manifest, embedding cache, and LanceDB data — is created inside each project you index via `--project-dir`.
+
+```
+~/.kiro/skills/semantic-index/   ← skill code (shared, installed once)
+~/project-a/.index/              ← index data for project-a
+~/project-b/.index/              ← index data for project-b
+```
+
+Each project gets its own independent `.index/`, so you can index multiple projects without conflicts. Add `.index/` to your project's `.gitignore` — it's fully rebuildable.
 
 ## Installation
 
+Run the setup script to create a virtual environment and install dependencies:
+
 ```bash
-cd semantic-index/scripts
+cd ~/.kiro/skills/semantic-index/scripts
 bash setup.sh
 ```
 
-This creates a `.venv` in the `scripts/` directory and installs all dependencies. Only needs to run once per machine.
+This creates a `.venv` inside the `scripts/` directory and installs all Python dependencies. Only needs to run once per machine.
 
 ### Verify Installation
 
 ```bash
-semantic-index/scripts/.venv/bin/python -c "import lancedb, tree_sitter, tiktoken; print('All dependencies OK')"
+~/.kiro/skills/semantic-index/scripts/.venv/bin/python -c \
+  "import lancedb, tree_sitter, tiktoken; print('All dependencies OK')"
 ```
 
 ## Configuration
@@ -89,22 +136,31 @@ data/large-dataset.json
 
 All commands output structured JSON to stdout. Progress and logs go to stderr.
 
-In the examples below, `SKILL_PATH` refers to the absolute path to the `semantic-index` directory, and `PROJECT` refers to your target project root.
+The examples below use:
+- `SKILL=~/.kiro/skills/semantic-index` — where the skill is installed
+- `PROJECT=~/my-project` — the project you want to index
+
+Set these for convenience, or substitute your own paths:
+
+```bash
+SKILL=~/.kiro/skills/semantic-index
+PROJECT=~/my-project
+```
 
 ### Build the Index
 
 ```bash
 # Index a project (incremental — only new/changed files)
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/build_index.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
   --project-dir $PROJECT
 
 # Force full re-index (ignore manifest, re-embed everything)
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/build_index.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
   --project-dir $PROJECT \
   --full
 
 # Use a custom config file
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/build_index.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
   --project-dir $PROJECT \
   --config /path/to/custom-config.json
 ```
@@ -135,25 +191,25 @@ If nothing changed since last index:
 
 ```bash
 # Basic semantic search
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/semantic_search.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
   --project-dir $PROJECT \
   --query "how does authentication work?"
 
 # Limit results and set minimum score
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/semantic_search.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
   --project-dir $PROJECT \
   --query "error handling patterns" \
   --top-k 5 \
   --threshold 0.5
 
 # Filter by language
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/semantic_search.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
   --project-dir $PROJECT \
   --query "database connection setup" \
   --filter-lang python
 
 # Filter by file path glob
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/semantic_search.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
   --project-dir $PROJECT \
   --query "API route definitions" \
   --filter-path "src/**"
@@ -184,7 +240,7 @@ Output:
 ### Check Index Status
 
 ```bash
-$SKILL_PATH/scripts/.venv/bin/python $SKILL_PATH/scripts/index_status.py \
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/index_status.py \
   --project-dir $PROJECT
 ```
 
