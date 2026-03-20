@@ -3,6 +3,7 @@
 
 Usage:
     python build_index.py --project-dir <path> [--config <config.json>] [--full]
+                          [--batch-size N]
 
 Exit codes:
     0  Success (or no changes detected)
@@ -30,6 +31,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_FILE_BATCH_SIZE = 50
+
 
 def _handle_error(error: Exception, exit_code: int = 2) -> None:
     """Output error as JSON to stdout and exit."""
@@ -41,11 +44,26 @@ def _handle_error(error: Exception, exit_code: int = 2) -> None:
     sys.exit(exit_code)
 
 
+def _batched(items: list, size: int):
+    """Yield successive batches of *size* items from *items*."""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the semantic index for a project")
     parser.add_argument("--project-dir", required=True, help="Project root directory")
     parser.add_argument("--config", default=None, help="Path to config.json")
     parser.add_argument("--full", action="store_true", help="Force full re-index")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_FILE_BATCH_SIZE,
+        help=(
+            f"Number of files to process per batch (default: {DEFAULT_FILE_BATCH_SIZE}). "
+            "Smaller batches use less memory; larger batches reduce store commit overhead."
+        ),
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -80,44 +98,75 @@ def main() -> None:
         embedder = Embedder(config, project_dir=args.project_dir)
         store = VectorStore(args.project_dir, config)
 
-        # Chunk new/changed files
-        all_chunks = []
+        # --- Phase 1: process new/changed files in batches ---
+        total_chunks_created = 0
+        total_api_calls = 0
         chunk_counts: dict[str, int] = {}
+        file_batch_size = max(1, args.batch_size)
+        files_to_index = changes.to_index
+        total_files = len(files_to_index)
+        files_processed = 0
 
-        for i, file_path in enumerate(changes.to_index, 1):
-            print(f"  Chunking [{i}/{len(changes.to_index)}] {file_path}...", file=sys.stderr)
-            chunks = chunk_file(file_path, args.project_dir, config)
-            chunk_counts[file_path] = len(chunks)
-            all_chunks.extend(chunks)
-
-        # Embed first — if this fails, the old index stays completely intact
-        api_calls = 0
-        if all_chunks:
-            api_calls = embedder.embed_chunks(all_chunks)
-
-        # === Commit phase: all mutations happen after successful embedding ===
-        try:
-            # Remove chunks for files deleted from disk
-            for file_path in changes.to_delete:
-                store.delete_by_file(file_path)
-                logger.info("Deleted chunks for removed file: %s", file_path)
-
-            # Remove old chunks for ALL changed files (including those that
-            # now produce zero chunks, e.g. shrunk below min_tokens)
-            for file_path in changes.to_index:
-                store.delete_by_file(file_path)
-
-            # Store new chunks
-            if all_chunks:
-                store.add(all_chunks)
-        except Exception as exc:
-            logger.error(
-                "Store commit failed after embedding. Index may be in a partial state. "
-                "Run 'build_index.py --full' to rebuild. Error: %s", exc,
+        for batch_num, file_batch in enumerate(_batched(files_to_index, file_batch_size), 1):
+            batch_label = (
+                f"Batch {batch_num}/"
+                f"{(total_files + file_batch_size - 1) // file_batch_size}"
             )
-            raise
+            print(
+                f"\n{batch_label}: processing {len(file_batch)} files...",
+                file=sys.stderr,
+            )
 
-        # Update manifest with chunk counts
+            # 1. Chunk the batch
+            batch_chunks = []
+            for file_path in file_batch:
+                files_processed += 1
+                print(
+                    f"  Chunking [{files_processed}/{total_files}] {file_path}...",
+                    file=sys.stderr,
+                )
+                chunks = chunk_file(file_path, args.project_dir, config)
+                chunk_counts[file_path] = len(chunks)
+                batch_chunks.extend(chunks)
+
+            # 2. Embed the batch
+            batch_api_calls = 0
+            if batch_chunks:
+                batch_api_calls = embedder.embed_chunks(batch_chunks)
+
+            # 3. Commit to store: delete old, add new
+            try:
+                for file_path in file_batch:
+                    store.delete_by_file(file_path)
+
+                if batch_chunks:
+                    store.add(batch_chunks)
+            except Exception as exc:
+                logger.error(
+                    "Store commit failed at %s after embedding. "
+                    "Index may be partially updated for files processed so far. "
+                    "Run 'build_index.py --full' to rebuild. Error: %s",
+                    batch_label, exc,
+                )
+                raise
+
+            total_chunks_created += len(batch_chunks)
+            total_api_calls += batch_api_calls
+
+            print(
+                f"  {batch_label} done: {len(batch_chunks)} chunks committed",
+                file=sys.stderr,
+            )
+
+            # 4. Release batch memory
+            del batch_chunks
+
+        # --- Phase 2: handle deletions after all batches succeed ---
+        for file_path in changes.to_delete:
+            store.delete_by_file(file_path)
+            logger.info("Deleted chunks for removed file: %s", file_path)
+
+        # --- Phase 3: update manifest only after all batches succeed ---
         update_manifest(args.project_dir, changes, chunk_counts)
 
         duration = time.time() - start_time
@@ -126,9 +175,9 @@ def main() -> None:
             "files_indexed": len(changes.to_index),
             "files_skipped": changes.unchanged,
             "files_deleted": len(changes.to_delete),
-            "chunks_created": len(all_chunks),
+            "chunks_created": total_chunks_created,
             "duration_seconds": round(duration, 1),
-            "embedding_api_calls": api_calls,
+            "embedding_api_calls": total_api_calls,
         }
         print(json.dumps(result, indent=2))
 

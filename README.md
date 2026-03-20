@@ -163,7 +163,14 @@ $SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
 $SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
   --project-dir $PROJECT \
   --config /path/to/custom-config.json
+
+# Control batch size for large repos (default: 50 files per batch)
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/build_index.py \
+  --project-dir $PROJECT \
+  --batch-size 25
 ```
+
+Files are processed in batches (default 50 files) to keep memory usage bounded. Each batch is chunked, embedded, and committed to the store before the next batch starts. This makes indexing viable for large monorepos (10K+ files) without OOM risk. Use `--batch-size` to tune the tradeoff between memory usage and commit overhead.
 
 Output on success:
 ```json
