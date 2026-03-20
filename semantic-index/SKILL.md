@@ -80,10 +80,18 @@ bash setup.sh
 This creates a `.venv` in the scripts directory and installs all dependencies.
 It only needs to run once per machine.
 
-The user must have an OpenRouter API key. Check for it:
-1. Environment variable `OPENROUTER_API_KEY`
-2. Project config at `.index/config.json` → `embedding.api_key` field
-3. If neither exists, ask the user to provide one
+Embedding provider setup depends on the `embedding.provider` field in
+`.index/config.json` (defaults to `"openrouter"`):
+
+- **openrouter**: Requires an API key. Check `OPENROUTER_API_KEY` env var,
+  then `config.embedding.api_key`. If neither exists, ask the user.
+- **huggingface**: No API key needed. On first run, the model is downloaded
+  to `~/.cache/huggingface/hub` (~274MB for Nomic). Subsequent runs load
+  from cache. Works fully offline after first download.
+
+If no `.index/config.json` exists yet, the scripts create one on first run.
+The provider choice is purely a configuration concern — indexing and search
+commands work identically regardless of provider.
 
 ## Core Commands
 
@@ -110,7 +118,7 @@ What this does:
 2. Respects .gitignore and .indexignore patterns
 3. Computes SHA-256 hashes to detect changed files
 4. Chunks files using AST-aware splitting (code) or header-based splitting (markdown)
-5. Embeds chunks via OpenRouter API
+5. Embeds chunks via the configured provider (OpenRouter API or local HuggingFace)
 6. Stores embeddings in `.index/` (LanceDB format)
 7. Saves file manifest for incremental re-indexing
 
@@ -217,7 +225,7 @@ Error output (stdout, JSON):
 ```json
 {
   "status": "error",
-  "error": "No API key found. Set OPENROUTER_API_KEY environment variable or add api_key to .index/config.json",
+  "error": "OpenRouter provider requires an API key. Set OPENROUTER_API_KEY env var, add api_key to .index/config.json, or switch to 'huggingface' provider for local embedding.",
   "error_type": "EmbeddingError"
 }
 ```
@@ -252,13 +260,15 @@ Key settings the user might want to change:
 
 Environment variable overrides:
 - `OPENROUTER_API_KEY` → overrides `embedding.api_key`
+- `SEMANTIC_INDEX_PROVIDER` → overrides `embedding.provider`
 - `SEMANTIC_INDEX_MODEL` → overrides `embedding.model`
 - `SEMANTIC_INDEX_DIMENSIONS` → overrides `embedding.dimensions`
+- `HF_HUB_CACHE` → HuggingFace model cache directory (default `~/.cache/huggingface/hub`)
 
 ## Troubleshooting
 
 - **"No index found"**: Run `build_index.py` first to create the `.index/` directory
-- **"No API key found"**: Set `OPENROUTER_API_KEY` env var or add to `.index/config.json`
+- **"No API key found"**: Either set `OPENROUTER_API_KEY` env var / add to config, or switch to `"huggingface"` provider in `.index/config.json` for local embedding with no API key
 - **Slow indexing**: Large projects (>1000 files) take time on first run; subsequent runs are incremental
 - **Poor search results**: Try adjusting `chunking.max_tokens` (smaller = more precise, larger = more context) or switching to a code-specific embedding model
 - **"Module not found" errors**: Re-run `setup.sh` to ensure venv is properly configured

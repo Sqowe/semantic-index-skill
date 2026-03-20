@@ -51,7 +51,8 @@ A SKILL that gives any AI assistant the ability to create and query a semantic i
 semantic-index/
 ├── SKILL.md                          # Main skill instructions (required)
 ├── scripts/
-│   ├── requirements.txt              # Python dependencies
+│   ├── requirements.txt              # Core Python dependencies
+│   ├── requirements-huggingface.txt  # Optional: local embedding deps
 │   ├── setup.py                      # One-command setup: venv + deps
 │   ├── build_index.py                # CLI: build/rebuild the semantic index
 │   ├── semantic_search.py            # CLI: search the index by meaning
@@ -59,7 +60,11 @@ semantic-index/
 │   └── lib/
 │       ├── __init__.py
 │       ├── chunker.py                # Code & markdown chunking logic
-│       ├── embedder.py               # Embedding API client (OpenRouter + pluggable)
+│       ├── embedder.py               # Provider factory + EmbeddingProvider ABC
+│       ├── providers/
+│       │   ├── __init__.py
+│       │   ├── openrouter.py         # OpenRouter REST API provider
+│       │   └── huggingface.py        # Local sentence-transformers provider
 │       ├── store.py                  # LanceDB vector store wrapper
 │       ├── hasher.py                 # File change detection (SHA-256 manifest)
 │       ├── config.py                 # Configuration loader
@@ -166,10 +171,18 @@ bash setup.sh
 This creates a `.venv` in the scripts directory and installs all dependencies.
 It only needs to run once per machine.
 
-The user must have an OpenRouter API key. Check for it:
-1. Environment variable `OPENROUTER_API_KEY`
-2. Project config at `.index/config.json` → `api_key` field
-3. If neither exists, ask the user to provide one
+Embedding provider setup depends on the `embedding.provider` field in
+`.index/config.json` (defaults to `"openrouter"`):
+
+- **openrouter**: Requires an API key. Check `OPENROUTER_API_KEY` env var,
+  then `config.embedding.api_key`. If neither exists, ask the user.
+- **huggingface**: No API key needed. On first run, the model is downloaded
+  to `~/.cache/huggingface/hub` (~274MB for Nomic). Subsequent runs load
+  from cache. Works fully offline after first download.
+
+If no `.index/config.json` exists yet, the scripts create one on first run.
+The provider choice is purely a configuration concern — indexing and search
+commands work identically regardless of provider.
 
 ## Core Commands
 
@@ -188,7 +201,7 @@ What this does:
 2. Respects .gitignore and .indexignore patterns
 3. Computes SHA-256 hashes to detect changed files
 4. Chunks files using AST-aware splitting (code) or header-based splitting (markdown)
-5. Embeds chunks via OpenRouter API
+5. Embeds chunks via the configured provider (OpenRouter API or local HuggingFace)
 6. Stores embeddings in `.index/` (LanceDB format)
 7. Saves file manifest for incremental re-indexing
 
@@ -403,41 +416,161 @@ Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby, PHP
 **Supported languages (regex fallback, Phase 1):**
 All other text files matching configured extensions
 
-### 4.6 embedder.py — Embedding API Client
+### 4.6 embedder.py — Provider Abstraction & Factory
 
-Responsibilities:
-- Send text chunks to OpenRouter API for embedding
-- Handle batching (OpenRouter supports batch embedding)
-- Implement retry with exponential backoff
-- Rate limiting compliance
-- Cache embeddings by chunk content hash (avoid re-embedding unchanged chunks)
+The embedding system uses a provider pattern. `embedder.py` contains the abstract
+interface and factory function. Concrete providers live in `providers/`.
 
-Interface:
+#### Abstract Interface (embedder.py)
+
 ```python
-class Embedder:
-    def __init__(self, config: Config):
-        """Initialize with API key, model name, dimensions from config."""
+from abc import ABC, abstractmethod
+from typing import Optional
 
+class EmbeddingProvider(ABC):
+    """Base class for all embedding providers."""
+
+    @abstractmethod
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts. Returns list of vectors."""
+        """Embed a batch of document texts. Returns list of vectors.
+        Provider handles prefixing (e.g., 'search_document:' for Nomic)."""
 
+    @abstractmethod
     def embed_query(self, query: str) -> list[float]:
-        """Embed a single search query. May use different prefix/instruction
-        depending on the model (e.g., Nomic uses 'search_query:' prefix)."""
+        """Embed a single search query. Returns one vector.
+        Provider handles prefixing (e.g., 'search_query:' for Nomic)."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int:
+        """Return the dimensionality of the embedding vectors."""
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """Return the model identifier string."""
+
+
+def create_embedder(config) -> EmbeddingProvider:
+    """Factory: instantiate the right provider based on config.embedding.provider.
+
+    Supported providers:
+      - "openrouter": REST API via OpenRouter (requires API key)
+      - "huggingface": Local inference via sentence-transformers (no API key)
+    """
+    provider = config.embedding.provider
+
+    if provider == "openrouter":
+        from .providers.openrouter import OpenRouterProvider
+        return OpenRouterProvider(config)
+    elif provider == "huggingface":
+        from .providers.huggingface import HuggingFaceProvider
+        return HuggingFaceProvider(config)
+    else:
+        raise ValueError(f"Unknown embedding provider: '{provider}'. "
+                         f"Supported: 'openrouter', 'huggingface'")
 ```
 
-OpenRouter embedding API details:
-- Endpoint: `https://openrouter.ai/api/v1/embeddings`
-- Auth: `Authorization: Bearer <api_key>`
-- Body: `{"model": "<model>", "input": ["text1", "text2", ...], "dimensions": N}`
-- Response: `{"data": [{"embedding": [...], "index": 0}, ...]}`
-- Batch size: send up to 100 texts per request
-- Some models (like Nomic) require prefixes: `search_document:` for indexing, `search_query:` for querying
+Note: Provider imports are lazy (inside the factory function). This means
+`sentence-transformers` is never imported if the user uses OpenRouter, and
+`requests` is never imported if the user uses HuggingFace. This keeps
+dependencies optional.
 
-Embedding cache:
+#### providers/openrouter.py
+
+The existing OpenRouter implementation, extracted into its own module:
+
+```python
+class OpenRouterProvider(EmbeddingProvider):
+    def __init__(self, config):
+        self.api_key = config.get_api_key()  # env var or config file
+        self.model = config.embedding.model
+        self.dimensions = config.embedding.dimensions
+        self.batch_size = config.embedding.batch_size
+        self.document_prefix = config.embedding.document_prefix
+        self.query_prefix = config.embedding.query_prefix
+        self.max_retries = config.embedding.max_retries
+        self.retry_delay = config.embedding.retry_delay_seconds
+```
+
+Responsibilities:
+- REST calls to `https://openrouter.ai/api/v1/embeddings`
+- Auth: `Authorization: Bearer <api_key>`
+- Body: `{"model": "<model>", "input": ["text1", ...], "dimensions": N}`
+- Batching: up to 100 texts per request
+- Retry with exponential backoff
+- Prefixes for asymmetric models (Nomic: `search_document:` / `search_query:`)
+
+#### providers/huggingface.py
+
+Local embedding using the `sentence-transformers` library:
+
+```python
+class HuggingFaceProvider(EmbeddingProvider):
+    def __init__(self, config):
+        # Lazy import — only loaded when this provider is selected
+        from sentence_transformers import SentenceTransformer
+
+        self.model_id = config.embedding.model
+        self._dimensions = config.embedding.dimensions
+        self.document_prefix = config.embedding.document_prefix
+        self.query_prefix = config.embedding.query_prefix
+        self.batch_size = config.embedding.batch_size
+        self.device = config.embedding.get("device", None)  # None = auto-detect
+
+        # Load model (downloads on first use to ~/.cache/huggingface/hub)
+        self._model = SentenceTransformer(
+            self.model_id,
+            trust_remote_code=True,
+            device=self.device,  # None → auto (CUDA > MPS > CPU)
+        )
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        prefixed = [self.document_prefix + t for t in texts]
+        embeddings = self._model.encode(
+            prefixed,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, query: str) -> list[float]:
+        prefixed = self.query_prefix + query
+        embedding = self._model.encode(
+            [prefixed],
+            convert_to_numpy=True,
+        )
+        return embedding[0].tolist()
+
+    def get_dimensions(self) -> int:
+        return self._dimensions
+
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+```
+
+Key behaviors:
+- **First run**: Downloads model to `~/.cache/huggingface/hub` (274MB for Nomic).
+  Override cache location with `HF_HUB_CACHE` env var.
+- **Device auto-detection**: sentence-transformers automatically selects
+  CUDA (NVIDIA GPU) > MPS (Apple Silicon) > CPU. No config needed, but
+  `device` field in config can force a specific device.
+- **Performance**: ~50-100 chunks/sec on CPU, ~500+ on GPU. A typical 1,600-chunk
+  project indexes in 15-30 seconds on CPU.
+- **Same model compatibility**: `nomic-ai/nomic-embed-text-v1.5` produces identical
+  vectors whether run through OpenRouter or locally. Indexes built with one provider
+  can be searched with the other, as long as model + dimensions match.
+- **No API key needed**: Fully offline after first model download.
+
+#### Embedding Cache
+
+The cache layer sits above the provider abstraction (in `embedder.py`):
+
 - Store in `.index/embedding_cache.json`: `{content_hash: vector}`
-- On indexing: check cache before calling API
-- Saves cost when re-indexing files where only some chunks changed
+- On indexing: check cache before calling the provider
+- Cache is invalidated when model or dimensions change
+- Saves cost (OpenRouter) or time (HuggingFace) on incremental re-indexing
 
 ### 4.7 store.py — Vector Store (LanceDB)
 
@@ -573,7 +706,8 @@ Output (stdout, JSON):
     "query_prefix": "search_query: ",
     "document_prefix": "search_document: ",
     "max_retries": 3,
-    "retry_delay_seconds": 1.0
+    "retry_delay_seconds": 1.0,
+    "device": null
   },
 
   "chunking": {
@@ -607,6 +741,42 @@ Output (stdout, JSON):
 }
 ```
 
+### Provider-Specific Configuration
+
+The `embedding` section works for both providers. The `provider` field selects
+which backend processes the embeddings:
+
+**`"openrouter"` (default)** — Remote API:
+- Requires `api_key` (or `OPENROUTER_API_KEY` env var)
+- `batch_size`: up to 100 texts per API call (default 50)
+- `max_retries` and `retry_delay_seconds`: for transient API failures
+- `device`: ignored (not applicable)
+
+**`"huggingface"` — Local inference:**
+- No `api_key` needed (field ignored)
+- `model`: any sentence-transformers compatible model from HuggingFace Hub
+- `batch_size`: controls in-process batch size (default 50, can increase on GPU)
+- `device`: `null` (auto-detect), `"cpu"`, `"cuda"`, or `"mps"` (Apple Silicon)
+- `max_retries`: ignored (no network calls)
+- First run downloads model to `~/.cache/huggingface/hub` (override with `HF_HUB_CACHE` env var)
+
+**Example: switching to local HuggingFace:**
+```json
+{
+  "embedding": {
+    "provider": "huggingface",
+    "model": "nomic-ai/nomic-embed-text-v1.5",
+    "dimensions": 768,
+    "batch_size": 64,
+    "device": null
+  }
+}
+```
+
+The same model name works with both providers. An index built with OpenRouter
+can be searched with HuggingFace and vice versa — as long as model + dimensions
+match, the vectors are identical.
+
 ### .indexignore
 
 Works like `.gitignore` — one pattern per line. Applied in addition to `.gitignore` and `config.exclude_patterns`.
@@ -625,8 +795,10 @@ data/large-dataset.json
 | Variable | Purpose | Overrides |
 |----------|---------|-----------|
 | `OPENROUTER_API_KEY` | API key for OpenRouter | `config.embedding.api_key` |
+| `SEMANTIC_INDEX_PROVIDER` | Embedding provider | `config.embedding.provider` |
 | `SEMANTIC_INDEX_MODEL` | Embedding model name | `config.embedding.model` |
 | `SEMANTIC_INDEX_DIMENSIONS` | Vector dimensions | `config.embedding.dimensions` |
+| `HF_HUB_CACHE` | HuggingFace model cache dir | Default `~/.cache/huggingface/hub` |
 
 ---
 
@@ -762,12 +934,17 @@ def index_project(project_dir, config):
 
 ### Cost Estimation
 
-For a typical project:
-- 500 files, average 200 lines each = ~100K lines
-- Average chunk: ~300 tokens, ~333 chunks per 100 files → ~1,650 chunks total
-- Total tokens: ~500K tokens
-- Nomic on OpenRouter: ~$0.02/1M tokens → **~$0.01 per full index**
-- Incremental re-index (10 changed files): **~$0.0002**
+For a typical project (500 files, ~100K lines, ~1,650 chunks, ~500K tokens):
+
+| Provider | Full Index Cost | Incremental (10 files) | Speed |
+|----------|----------------|----------------------|-------|
+| **OpenRouter** (Nomic) | ~$0.01 | ~$0.0002 | ~5-15 sec (network-bound) |
+| **HuggingFace** (local CPU) | $0.00 | $0.00 | ~15-30 sec (compute-bound) |
+| **HuggingFace** (local GPU) | $0.00 | $0.00 | ~3-5 sec |
+
+HuggingFace has a one-time model download cost (~274MB for Nomic, ~600MB for
+larger models) but zero ongoing API costs. For teams indexing frequently or
+working in air-gapped environments, local is significantly cheaper over time.
 
 ---
 
@@ -922,18 +1099,58 @@ pathspec>=0.12.0
 | 3.3 | Add optional re-ranking step (cross-encoder model via OpenRouter) |
 | 3.4 | Tunable weights: user can adjust semantic vs. keyword balance |
 
-### Phase 4: Provider Abstraction
+### Phase 4: HuggingFace Local Embedding Provider
 
-**Goal**: Support Ollama (local), OpenAI, and other providers natively.
+**Goal**: Add local embedding via sentence-transformers as an alternative to
+OpenRouter, enabling zero-cost, offline, low-latency indexing and search.
+
+| Step | Task | Details |
+|------|------|---------|
+| 4.1 | Create `lib/providers/` package | `__init__.py` with provider registry |
+| 4.2 | Extract `OpenRouterProvider` from existing `embedder.py` | Move current OpenRouter logic to `providers/openrouter.py`, keep same behavior |
+| 4.3 | Define `EmbeddingProvider` ABC in `embedder.py` | `embed_texts()`, `embed_query()`, `get_dimensions()`, `model_name` property |
+| 4.4 | Create `create_embedder()` factory in `embedder.py` | Reads `config.embedding.provider`, lazy-imports the right provider |
+| 4.5 | Implement `HuggingFaceProvider` in `providers/huggingface.py` | sentence-transformers `SentenceTransformer.encode()`, auto device detection |
+| 4.6 | Create `requirements-huggingface.txt` | `sentence-transformers>=3.0.0`, `torch>=2.0.0` |
+| 4.7 | Update `setup.sh` to handle optional deps | Detect provider from config or `--with-huggingface` flag, install extras only when needed |
+| 4.8 | Update `config.py` to support `SEMANTIC_INDEX_PROVIDER` env var | Env var override for provider selection |
+| 4.9 | Update `build_index.py` and `semantic_search.py` | Replace `Embedder(config)` with `create_embedder(config)` |
+| 4.10 | Add `device` field to config schema and `Config` class | `null` (auto), `"cpu"`, `"cuda"`, `"mps"` |
+| 4.11 | Test: same model produces identical vectors via both providers | Index with OpenRouter, search with HuggingFace (and vice versa) |
+| 4.12 | Update `references/embedding-models.md` | Add local model recommendations, RAM requirements, download sizes |
+
+**Dependencies (requirements-huggingface.txt):**
+```
+sentence-transformers>=3.0.0
+torch>=2.0.0
+```
+
+These are only installed when using the `huggingface` provider. The core
+`requirements.txt` stays lightweight (no torch dependency).
+
+**Implementation notes:**
+
+- The refactor from monolithic `Embedder` class to `EmbeddingProvider` ABC is
+  the main code change. Existing OpenRouter logic moves to `providers/openrouter.py`
+  with minimal modification.
+- The embedding cache layer stays in `embedder.py`, above the provider. Both
+  providers benefit from caching identically.
+- `HuggingFaceProvider.__init__()` triggers model download on first use. This
+  can take 1-5 minutes depending on model size and network speed. The provider
+  should print a progress message to stderr: `"Downloading model nomic-ai/nomic-embed-text-v1.5 (~274MB)..."`.
+- After download, model loads from disk cache in 2-5 seconds.
+
+### Phase 5: Additional Providers (Optional)
+
+**Goal**: Add more provider options for flexibility.
 
 | Step | Task |
 |------|------|
-| 4.1 | Abstract `embedder.py` into provider interface |
-| 4.2 | Implement OllamaEmbedder (local, no API key, fully offline) |
-| 4.3 | Implement OpenAIEmbedder (direct API, no OpenRouter middleman) |
-| 4.4 | Auto-detect provider from model name or config |
+| 5.1 | Implement `OllamaProvider` (local Ollama REST API at `localhost:11434`) |
+| 5.2 | Implement `OpenAIProvider` (direct OpenAI API, no OpenRouter middleman) |
+| 5.3 | Provider auto-detection from model name patterns (e.g., `openai/...` → OpenAI) |
 
-### Phase 5: MCP Bridge (Optional)
+### Phase 6: MCP Bridge (Optional)
 
 **Goal**: Expose the same indexing/search as an MCP server for tools that prefer MCP.
 
@@ -964,14 +1181,39 @@ if [ ! -d "$VENV_DIR" ]; then
     echo "Created virtual environment at $VENV_DIR"
 fi
 
-# Activate and install dependencies
+# Activate and install core dependencies
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip -q
 pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
+# Install HuggingFace dependencies if requested or if config says huggingface
+if [ "${1:-}" = "--with-huggingface" ]; then
+    echo "Installing HuggingFace local embedding dependencies..."
+    pip install -r "$SCRIPT_DIR/requirements-huggingface.txt" -q
+elif [ -f "${2:-.index/config.json}" ]; then
+    # Auto-detect from config if it exists
+    PROVIDER=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    print(cfg.get('embedding', {}).get('provider', ''))
+except: pass
+" "${2:-.index/config.json}" 2>/dev/null || true)
+    if [ "$PROVIDER" = "huggingface" ]; then
+        echo "Config uses HuggingFace provider. Installing local embedding dependencies..."
+        pip install -r "$SCRIPT_DIR/requirements-huggingface.txt" -q
+    fi
+fi
+
 echo "Setup complete. Dependencies installed."
 echo "Virtual environment: $VENV_DIR"
 ```
+
+**Usage:**
+- `bash setup.sh` — install core deps only (OpenRouter provider works out of the box)
+- `bash setup.sh --with-huggingface` — install core + HuggingFace deps
+- If `.index/config.json` exists with `"provider": "huggingface"`, HuggingFace deps
+  are auto-installed
 
 ### build_index.py — Entry Point Pseudocode
 
@@ -1171,16 +1413,16 @@ if __name__ == "__main__":
 |---------|----------------------------|----------------|----------------|-------------|-------------|
 | **Architecture** | SKILL (scripts) | MCP server | MCP server | MCP server | MCP server |
 | **Vector DB** | LanceDB (file-based) | None (symbol index) | Milvus Cloud | Qdrant (Docker) | SQLite-vec |
-| **Embeddings** | OpenRouter (configurable) | N/A | OpenAI (required) | Ollama (local) | sentence-transformers |
+| **Embeddings** | OpenRouter or local HuggingFace | N/A | OpenAI (required) | Ollama (local) | sentence-transformers |
 | **Setup** | `bash setup.sh` | pip + config | npm + Zilliz + OpenAI keys | npm + Docker | pip + model download |
 | **Infrastructure** | None (file-based) | None | Zilliz Cloud | Docker | None |
 | **AST parsing** | Tree-sitter | Tree-sitter (7 langs) | AST (18 langs) | ast-grep (18 langs) | Tree-sitter (8 langs) |
 | **Incremental** | SHA-256 manifest | Merkle tree | Checkpointed batches | Checkpointed batches | Not specified |
 | **Hybrid search** | Phase 3 (planned) | Regex/fuzzy | BM25 + vector | BM25 + vector (RRF) | BM25 + vector |
-| **Offline** | No (needs API) | Yes | No | Yes (Ollama) | Yes |
+| **Offline** | Yes (HuggingFace) / No (OpenRouter) | Yes | No | Yes (Ollama) | Yes |
 | **AI-debuggable** | Yes (AI reads + runs scripts) | No (opaque MCP) | No (opaque MCP) | No (opaque MCP) | No (opaque MCP) |
 | **Portability** | Any SKILL-compatible tool | Any MCP client | Any MCP client | Any MCP client | Any MCP client |
-| **Cost** | ~$0.01/full index | Free | Zilliz + OpenAI | Free (self-hosted) | Free |
+| **Cost** | Free (HuggingFace) or ~$0.01 (OpenRouter) | Free | Zilliz + OpenAI | Free (self-hosted) | Free |
 
 ### Key Differentiators
 
@@ -1188,7 +1430,7 @@ if __name__ == "__main__":
 
 2. **Zero infrastructure**: No Docker, no cloud accounts, no running servers. Just Python scripts and a file-based database. This makes it work in constrained environments (CI/CD, air-gapped machines, lightweight VMs).
 
-3. **Provider flexibility through OpenRouter**: One API key gives access to dozens of embedding models. The user can switch from Nomic to OpenAI to Cohere without changing code — just update `config.json`.
+3. **Dual-mode provider flexibility**: Users choose between OpenRouter (remote API, one key for dozens of models) and HuggingFace (local, zero-cost, offline-capable). Switching is a single config field change — same model produces identical vectors in both modes. No other tool offers this seamless local/remote toggle.
 
 4. **Incremental by default**: SHA-256 manifest tracking means re-indexing a large project after changing 3 files costs fractions of a cent and takes seconds.
 
