@@ -70,6 +70,8 @@ class SearchConfig:
 
     default_top_k: int = 10
     default_threshold: float = 0.3
+    mode: str = "hybrid"           # "vector", "keyword", or "hybrid"
+    hybrid_alpha: float = 0.7      # 0.0 = pure keyword, 1.0 = pure vector
 
 
 @dataclass

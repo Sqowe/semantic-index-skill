@@ -17,6 +17,7 @@ import logging
 import sys
 import time
 
+from lib.bm25 import BM25Index
 from lib.config import load_config, ensure_index_dir
 from lib.hasher import detect_changes, update_manifest
 from lib.chunker import chunk_file
@@ -79,12 +80,59 @@ def main() -> None:
         # Detect changes
         changes = detect_changes(args.project_dir, config, force_full=args.full)
 
+        # Initialize components (needed for BM25 bootstrap check even if no changes)
+        store = VectorStore(args.project_dir, config)
+        bm25 = BM25Index(args.project_dir)
+
+        # Load existing BM25 index for incremental updates.
+        # If BM25 index is missing but vector store has data, bootstrap
+        # BM25 from existing chunks (upgrade from pre-hybrid index).
+        bm25_loaded = bm25.load()
+        bm25_bootstrapped = False
+        if not bm25_loaded and store.has_index():
+            print(
+                "BM25 index missing — bootstrapping from existing vector store...",
+                file=sys.stderr,
+            )
+            bootstrap_count = 0
+            try:
+                for chunk_batch in store.iter_all_chunks(batch_size=500):
+                    bm25.add_chunks(chunk_batch)
+                    bootstrap_count += len(chunk_batch)
+                    print(
+                        f"  Bootstrapped {bootstrap_count} chunks so far...",
+                        file=sys.stderr,
+                    )
+            except IndexingError as exc:
+                logger.error(
+                    "BM25 bootstrap failed due to schema mismatch: %s. "
+                    "Run 'build_index.py --full' to rebuild.", exc,
+                )
+                raise
+
+            if bootstrap_count > 0:
+                bm25_bootstrapped = True
+                print(
+                    f"  BM25 bootstrap complete: {bootstrap_count} chunks indexed",
+                    file=sys.stderr,
+                )
+
         if not changes.to_index and not changes.to_delete:
-            print(json.dumps({
-                "status": "up_to_date",
-                "message": "No changes detected",
-                "files_unchanged": changes.unchanged,
-            }, indent=2))
+            # Even with no changes, save BM25 if it was just bootstrapped
+            if bm25_bootstrapped:
+                bm25.save()
+                print(json.dumps({
+                    "status": "up_to_date",
+                    "message": "No file changes detected. BM25 index bootstrapped from existing vector store.",
+                    "files_unchanged": changes.unchanged,
+                    "bm25_bootstrapped": True,
+                }, indent=2))
+            else:
+                print(json.dumps({
+                    "status": "up_to_date",
+                    "message": "No changes detected",
+                    "files_unchanged": changes.unchanged,
+                }, indent=2))
             sys.exit(0)
 
         print(
@@ -94,9 +142,8 @@ def main() -> None:
             file=sys.stderr,
         )
 
-        # Initialize components
+        # Initialize embedder (only needed when there are files to process)
         embedder = Embedder(config, project_dir=args.project_dir)
-        store = VectorStore(args.project_dir, config)
 
         # --- Phase 1: process new/changed files in batches ---
         total_chunks_created = 0
@@ -138,9 +185,26 @@ def main() -> None:
             try:
                 for file_path in file_batch:
                     store.delete_by_file(file_path)
+                    bm25.delete_by_file(file_path)
 
                 if batch_chunks:
                     store.add(batch_chunks)
+                    # Build BM25 records from chunks
+                    bm25_records = [
+                        {
+                            "id": c.id,
+                            "content": c.content,
+                            "file_path": c.file_path,
+                            "start_line": c.start_line,
+                            "end_line": c.end_line,
+                            "chunk_type": c.chunk_type.value,
+                            "language": c.language or "",
+                            "symbol_name": c.symbol_name or "",
+                            "token_count": c.token_count,
+                        }
+                        for c in batch_chunks
+                    ]
+                    bm25.add_chunks(bm25_records)
             except Exception as exc:
                 logger.error(
                     "Store commit failed at %s after embedding. "
@@ -164,9 +228,11 @@ def main() -> None:
         # --- Phase 2: handle deletions after all batches succeed ---
         for file_path in changes.to_delete:
             store.delete_by_file(file_path)
+            bm25.delete_by_file(file_path)
             logger.info("Deleted chunks for removed file: %s", file_path)
 
-        # --- Phase 3: update manifest only after all batches succeed ---
+        # --- Phase 3: save BM25 index and update manifest ---
+        bm25.save()
         update_manifest(args.project_dir, changes, chunk_counts)
 
         duration = time.time() - start_time

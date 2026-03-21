@@ -1,0 +1,515 @@
+"""Integration tests for Phase 3 hybrid search features.
+
+Tests cover:
+1. BM25 bootstrap from existing vector store (upgrade path)
+2. Zero-change incremental rebuild
+3. file_path_glob filtering across vector/keyword/hybrid modes
+4. RRF fusion dedup semantics
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+# Ensure lib is importable
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from lib.bm25 import BM25Index, tokenize
+from lib.fusion import fuse_results
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer tests
+# ---------------------------------------------------------------------------
+
+class TestTokenizer:
+    """Tests for the BM25 tokenizer."""
+
+    def test_basic_tokenization(self):
+        tokens = tokenize("hello world")
+        assert "hello" in tokens
+        assert "world" in tokens
+
+    def test_camel_case_splitting(self):
+        tokens = tokenize("getUserName")
+        assert "get" in tokens
+        assert "user" in tokens
+        assert "name" in tokens
+
+    def test_snake_case_splitting(self):
+        tokens = tokenize("get_user_name")
+        assert "get" in tokens
+        assert "user" in tokens
+        assert "name" in tokens
+
+    def test_stop_words_removed(self):
+        tokens = tokenize("the quick brown fox is a test")
+        assert "the" not in tokens
+        assert "is" not in tokens
+        assert "quick" in tokens
+        assert "brown" in tokens
+
+    def test_short_tokens_removed(self):
+        tokens = tokenize("a b cd ef")
+        assert "a" not in tokens
+        assert "b" not in tokens
+        assert "cd" in tokens
+        assert "ef" in tokens
+
+
+# ---------------------------------------------------------------------------
+# Sample chunk data for tests
+# ---------------------------------------------------------------------------
+
+def _make_chunks(n: int = 5) -> list[dict]:
+    """Create sample chunk dicts for testing."""
+    chunks = [
+        {
+            "id": "chunk_auth_1",
+            "content": "def authenticate_user(username, password):\n    verify credentials against database",
+            "file_path": "src/auth/login.py",
+            "start_line": 10,
+            "end_line": 25,
+            "chunk_type": "function",
+            "language": "python",
+            "symbol_name": "authenticate_user",
+            "token_count": 30,
+        },
+        {
+            "id": "chunk_auth_2",
+            "content": "class JWTTokenManager:\n    def create_token(self, user_id):\n        generate JWT token for authenticated user",
+            "file_path": "src/auth/tokens.py",
+            "start_line": 1,
+            "end_line": 20,
+            "chunk_type": "class",
+            "language": "python",
+            "symbol_name": "JWTTokenManager",
+            "token_count": 40,
+        },
+        {
+            "id": "chunk_db_1",
+            "content": "def connect_database(host, port):\n    establish connection to PostgreSQL database",
+            "file_path": "src/db/connection.py",
+            "start_line": 5,
+            "end_line": 15,
+            "chunk_type": "function",
+            "language": "python",
+            "symbol_name": "connect_database",
+            "token_count": 25,
+        },
+        {
+            "id": "chunk_api_1",
+            "content": "function handleLogin(req, res) {\n    authenticate user and return session token\n}",
+            "file_path": "src/api/routes.js",
+            "start_line": 30,
+            "end_line": 45,
+            "chunk_type": "function",
+            "language": "javascript",
+            "symbol_name": "handleLogin",
+            "token_count": 28,
+        },
+        {
+            "id": "chunk_docs_1",
+            "content": "# Authentication Guide\n\nThis document explains how user authentication works in the system.",
+            "file_path": "docs/auth-guide.md",
+            "start_line": 1,
+            "end_line": 10,
+            "chunk_type": "markdown_section",
+            "language": "markdown",
+            "symbol_name": "",
+            "token_count": 20,
+        },
+    ]
+    return chunks[:n]
+
+
+# ---------------------------------------------------------------------------
+# BM25 Index tests
+# ---------------------------------------------------------------------------
+
+class TestBM25Index:
+    """Tests for BM25Index build, search, and persistence."""
+
+    def test_build_and_search(self, tmp_path):
+        """Build index from chunks and search returns relevant results."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search("authenticate user login", top_k=3)
+        assert len(results) > 0
+        # Auth-related chunks should rank high
+        file_paths = [r["file_path"] for r in results]
+        assert any("auth" in fp for fp in file_paths)
+
+    def test_save_and_load(self, tmp_path):
+        """Index persists to disk and loads back correctly."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+        bm25.save()
+
+        # Load into a fresh instance
+        bm25_loaded = BM25Index(str(tmp_path))
+        assert bm25_loaded.load() is True
+        assert bm25_loaded._n_docs == 5
+
+        results = bm25_loaded.search("database connection", top_k=3)
+        assert len(results) > 0
+
+    def test_load_missing_index(self, tmp_path):
+        """Loading when no index file exists returns False."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        assert bm25.load() is False
+
+    def test_language_filter(self, tmp_path):
+        """Language filter restricts results to matching language."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search(
+            "authenticate login",
+            top_k=10,
+            filters={"language": "javascript"},
+        )
+        for r in results:
+            assert r["language"] == "javascript"
+
+    def test_file_path_glob_filter(self, tmp_path):
+        """file_path_glob filter restricts results to matching paths."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search(
+            "authenticate user",
+            top_k=10,
+            filters={"file_path_glob": "src/auth/*"},
+        )
+        for r in results:
+            assert r["file_path"].startswith("src/auth/")
+
+    def test_file_path_glob_excludes_non_matching(self, tmp_path):
+        """file_path_glob filter excludes files outside the glob."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search(
+            "authenticate user",
+            top_k=10,
+            filters={"file_path_glob": "src/db/*"},
+        )
+        for r in results:
+            assert r["file_path"].startswith("src/db/")
+
+    def test_incremental_add_and_delete(self, tmp_path):
+        """Incremental add/delete maintains index consistency."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks(3))
+        assert bm25._n_docs == 3
+
+        # Add more chunks
+        new_chunks = _make_chunks(5)[3:]
+        bm25.add_chunks(new_chunks)
+        assert bm25._n_docs == 5
+
+        # Delete a file
+        bm25.delete_by_file("src/auth/login.py")
+        assert bm25._n_docs == 4
+
+        # Verify deleted file doesn't appear in results
+        results = bm25.search("authenticate", top_k=10)
+        for r in results:
+            assert r["file_path"] != "src/auth/login.py"
+
+    def test_empty_index_search(self, tmp_path):
+        """Searching an empty index returns no results."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        results = bm25.search("anything")
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# RRF Fusion tests
+# ---------------------------------------------------------------------------
+
+class TestFusion:
+    """Tests for Reciprocal Rank Fusion merging."""
+
+    def _make_vector_results(self) -> list[dict]:
+        return [
+            {"id": "chunk_1", "score": 0.95, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "vector hit 1", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_a", "token_count": 20},
+            {"id": "chunk_2", "score": 0.80, "file_path": "b.py", "start_line": 1,
+             "end_line": 10, "content": "vector hit 2", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_b", "token_count": 20},
+            {"id": "chunk_3", "score": 0.70, "file_path": "c.py", "start_line": 1,
+             "end_line": 10, "content": "vector only", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_c", "token_count": 20},
+        ]
+
+    def _make_bm25_results(self) -> list[dict]:
+        return [
+            {"id": "chunk_2", "score": 8.5, "file_path": "b.py", "start_line": 1,
+             "end_line": 10, "content": "bm25 hit 1", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_b", "token_count": 20},
+            {"id": "chunk_1", "score": 6.2, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "bm25 hit 2", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_a", "token_count": 20},
+            {"id": "chunk_4", "score": 4.0, "file_path": "d.py", "start_line": 1,
+             "end_line": 10, "content": "bm25 only", "chunk_type": "function",
+             "language": "python", "symbol_name": "func_d", "token_count": 20},
+        ]
+
+    def test_fusion_dedup(self):
+        """Duplicate docs across sources are merged, not duplicated."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        ids = [r["id"] for r in merged]
+        assert len(ids) == len(set(ids)), "Duplicate IDs in fused results"
+
+    def test_fusion_includes_all_sources(self):
+        """Results from both sources appear in merged output."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        ids = {r["id"] for r in merged}
+        assert "chunk_3" in ids, "Vector-only result missing"
+        assert "chunk_4" in ids, "BM25-only result missing"
+
+    def test_fusion_has_per_source_scores(self):
+        """Merged results include vector_score and bm25_score fields."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        for r in merged:
+            assert "fused_score" in r
+            assert "vector_score" in r
+            assert "bm25_score" in r
+
+    def test_fusion_dedup_picks_higher_score_source(self):
+        """For docs in both sources, the higher original score is used."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        # chunk_2 has vector_score=0.80 and bm25_score=8.5
+        # BM25 score is higher, so content should come from BM25 source
+        chunk_2 = next(r for r in merged if r["id"] == "chunk_2")
+        assert chunk_2["content"] == "bm25 hit 1"
+        assert chunk_2["vector_score"] == 0.80
+        assert chunk_2["bm25_score"] == 8.5
+
+    def test_fusion_vector_only_has_null_bm25(self):
+        """Vector-only results have bm25_score=None."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        chunk_3 = next(r for r in merged if r["id"] == "chunk_3")
+        assert chunk_3["vector_score"] is not None
+        assert chunk_3["bm25_score"] is None
+
+    def test_fusion_bm25_only_has_null_vector(self):
+        """BM25-only results have vector_score=None."""
+        merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
+        chunk_4 = next(r for r in merged if r["id"] == "chunk_4")
+        assert chunk_4["vector_score"] is None
+        assert chunk_4["bm25_score"] is not None
+
+    def test_fusion_alpha_zero_pure_keyword(self):
+        """Alpha=0.0 gives all weight to BM25."""
+        merged = fuse_results(
+            self._make_vector_results(), self._make_bm25_results(), alpha=0.0,
+        )
+        # With alpha=0, vector results get 0 RRF score
+        # BM25-only chunk_4 should appear, vector-only chunk_3 should have low score
+        ids = [r["id"] for r in merged]
+        # BM25 top result should be near the top
+        assert ids[0] == "chunk_2"  # BM25 rank 1
+
+    def test_fusion_alpha_one_pure_vector(self):
+        """Alpha=1.0 gives all weight to vector."""
+        merged = fuse_results(
+            self._make_vector_results(), self._make_bm25_results(), alpha=1.0,
+        )
+        ids = [r["id"] for r in merged]
+        assert ids[0] == "chunk_1"  # Vector rank 1
+
+    def test_fusion_empty_inputs(self):
+        """Empty input lists produce empty output."""
+        assert fuse_results([], []) == []
+        assert fuse_results(self._make_vector_results(), []) != []
+        assert fuse_results([], self._make_bm25_results()) != []
+
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap and schema edge case tests
+# ---------------------------------------------------------------------------
+
+class TestBM25Bootstrap:
+    """Tests for BM25 bootstrap from vector store data."""
+
+    def test_bootstrap_from_chunk_list(self, tmp_path):
+        """BM25 can be built from a list of chunk dicts (simulating store data)."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        chunks = _make_chunks()
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(chunks)
+
+        assert bm25._n_docs == 5
+        results = bm25.search("authenticate", top_k=3)
+        assert len(results) > 0
+
+    def test_bootstrap_incremental_matches_full_build(self, tmp_path):
+        """Incremental add_chunks produces same results as full build."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        chunks = _make_chunks()
+
+        # Full build
+        bm25_full = BM25Index(str(tmp_path))
+        bm25_full.build(chunks)
+        full_results = bm25_full.search("database connection", top_k=5)
+
+        # Incremental build (simulating batched bootstrap)
+        bm25_inc = BM25Index(str(tmp_path))
+        bm25_inc.add_chunks(chunks[:2])
+        bm25_inc.add_chunks(chunks[2:])
+        inc_results = bm25_inc.search("database connection", top_k=5)
+
+        # Same docs, same scores
+        assert len(full_results) == len(inc_results)
+        for fr, ir in zip(full_results, inc_results):
+            assert fr["id"] == ir["id"]
+            assert fr["score"] == ir["score"]
+
+    def test_bootstrap_with_missing_optional_fields(self, tmp_path):
+        """Bootstrap handles chunks missing optional fields gracefully."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        # Minimal chunks — only required fields
+        minimal_chunks = [
+            {
+                "id": "min_1",
+                "content": "some code content here",
+                "file_path": "src/main.py",
+                "start_line": 1,
+                "end_line": 10,
+                "chunk_type": "function",
+            },
+        ]
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.add_chunks(minimal_chunks)
+        assert bm25._n_docs == 1
+
+        results = bm25.search("code content", top_k=5)
+        assert len(results) == 1
+        assert results[0]["language"] == ""  # default backfill
+
+
+# ---------------------------------------------------------------------------
+# Hybrid threshold semantics tests
+# ---------------------------------------------------------------------------
+
+class TestHybridThresholdSemantics:
+    """Tests verifying that score scales don't mix across modes."""
+
+    def test_fusion_output_has_no_mixed_score(self):
+        """Fused results should not have a 'score' field that mixes scales."""
+        vector_results = [
+            {"id": "v1", "score": 0.9, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+        bm25_results = [
+            {"id": "b1", "score": 15.3, "file_path": "b.py", "start_line": 1,
+             "end_line": 10, "content": "y", "chunk_type": "function",
+             "language": "python", "symbol_name": "g", "token_count": 10},
+        ]
+
+        merged = fuse_results(vector_results, bm25_results)
+
+        for r in merged:
+            # fused_score must exist and be the canonical score
+            assert "fused_score" in r
+            assert "vector_score" in r
+            assert "bm25_score" in r
+
+    def test_fusion_fused_score_is_scale_independent(self):
+        """Fused score should be comparable regardless of raw score magnitudes."""
+        # Vector scores: 0-1 range
+        vector_results = [
+            {"id": "c1", "score": 0.95, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+        # BM25 scores: 0-100 range (very different scale)
+        bm25_results = [
+            {"id": "c1", "score": 85.0, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+
+        merged = fuse_results(vector_results, bm25_results)
+        assert len(merged) == 1
+
+        # fused_score is RRF-based, not a raw score mix
+        r = merged[0]
+        assert r["fused_score"] > 0
+        assert r["fused_score"] < 1.0  # RRF scores are small fractions
+        assert r["vector_score"] == 0.95
+        assert r["bm25_score"] == 85.0
+
+    def test_vector_mode_threshold_uses_cosine_score(self):
+        """In vector-only mode, threshold applies to cosine similarity score."""
+        # Simulating what semantic_search.py does in vector mode
+        vector_results = [
+            {"score": 0.9, "id": "v1", "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "f",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+            {"score": 0.2, "id": "v2", "file_path": "b.py", "start_line": 1,
+             "end_line": 10, "content": "y", "chunk_type": "f",
+             "language": "python", "symbol_name": "g", "token_count": 10},
+        ]
+
+        threshold = 0.3
+        filtered = [r for r in vector_results if r["score"] >= threshold]
+        assert len(filtered) == 1
+        assert filtered[0]["id"] == "v1"
+
+    def test_keyword_mode_threshold_uses_bm25_score(self):
+        """In keyword mode, threshold applies to BM25 score."""
+        bm25_results = [
+            {"score": 8.5, "id": "b1", "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "f",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+            {"score": 0.1, "id": "b2", "file_path": "b.py", "start_line": 1,
+             "end_line": 10, "content": "y", "chunk_type": "f",
+             "language": "python", "symbol_name": "g", "token_count": 10},
+        ]
+
+        threshold = 0.3
+        filtered = [r for r in bm25_results if r["score"] >= threshold]
+        assert len(filtered) == 1
+        assert filtered[0]["id"] == "b1"

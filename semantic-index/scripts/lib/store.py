@@ -246,3 +246,121 @@ class VectorStore:
         if table is None:
             return False
         return table.count_rows() > 0
+
+    def get_all_chunks(self) -> list[dict[str, Any]]:
+        """Retrieve all chunks from the store (without vectors).
+
+        Used for bootstrapping the BM25 index from an existing vector store
+        when upgrading from a pre-hybrid index. Schema-tolerant: inspects
+        available columns and backfills missing fields with defaults.
+
+        Returns:
+            List of chunk dicts with id, file_path, content, etc.
+            Empty list if no index exists.
+
+        Raises:
+            IndexingError: If the store has rows but essential columns
+                (id, content, file_path) are missing.
+        """
+        table = self._get_table()
+        if table is None:
+            return []
+
+        try:
+            arrow_table = table.to_arrow()
+        except Exception as exc:
+            logger.warning("Failed to read arrow table from store: %s", exc)
+            return []
+
+        available = set(arrow_table.column_names)
+        required = {"id", "content", "file_path"}
+        missing_required = required - available
+        if missing_required:
+            from .models import IndexingError as IdxErr
+            raise IdxErr(
+                f"Vector store schema missing essential columns: {missing_required}. "
+                "Run 'build_index.py --full' to rebuild the index."
+            )
+
+        # Select available columns, skip vector
+        desired = [
+            "id", "file_path", "start_line", "end_line",
+            "content", "chunk_type", "language", "symbol_name", "token_count",
+        ]
+        select_cols = [c for c in desired if c in available]
+
+        try:
+            subset = arrow_table.select(select_cols)
+            rows = subset.to_pylist()
+        except Exception as exc:
+            logger.warning("Failed to select columns from store: %s", exc)
+            return []
+
+        # Backfill missing optional fields with defaults
+        defaults = {
+            "start_line": 0, "end_line": 0, "chunk_type": "unknown",
+            "language": "", "symbol_name": "", "token_count": 0,
+        }
+        for row in rows:
+            for field, default in defaults.items():
+                if field not in row:
+                    row[field] = default
+
+        return rows
+
+    def iter_all_chunks(self, batch_size: int = 500) -> Any:
+        """Yield chunks from the store in batches (without vectors).
+
+        Memory-efficient alternative to get_all_chunks() for large repos.
+        Schema-tolerant with the same backfill logic.
+
+        Args:
+            batch_size: Number of rows per batch.
+
+        Yields:
+            Lists of chunk dicts, each list up to batch_size items.
+
+        Raises:
+            IndexingError: If essential columns are missing.
+        """
+        table = self._get_table()
+        if table is None:
+            return
+
+        try:
+            arrow_table = table.to_arrow()
+        except Exception as exc:
+            logger.warning("Failed to read arrow table from store: %s", exc)
+            return
+
+        available = set(arrow_table.column_names)
+        required = {"id", "content", "file_path"}
+        missing_required = required - available
+        if missing_required:
+            from .models import IndexingError as IdxErr
+            raise IdxErr(
+                f"Vector store schema missing essential columns: {missing_required}. "
+                "Run 'build_index.py --full' to rebuild the index."
+            )
+
+        desired = [
+            "id", "file_path", "start_line", "end_line",
+            "content", "chunk_type", "language", "symbol_name", "token_count",
+        ]
+        select_cols = [c for c in desired if c in available]
+        subset = arrow_table.select(select_cols)
+
+        defaults = {
+            "start_line": 0, "end_line": 0, "chunk_type": "unknown",
+            "language": "", "symbol_name": "", "token_count": 0,
+        }
+
+        total_rows = subset.num_rows
+        for start in range(0, total_rows, batch_size):
+            end = min(start + batch_size, total_rows)
+            batch = subset.slice(start, end - start).to_pylist()
+            for row in batch:
+                for field, default in defaults.items():
+                    if field not in row:
+                        row[field] = default
+            yield batch

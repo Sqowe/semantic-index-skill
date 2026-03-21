@@ -35,6 +35,8 @@
   },
   "search": {
     "default_top_k": 10,
-    "default_threshold": 0.3
+    "default_threshold": 0.3,
+    "mode": "hybrid",
+    "hybrid_alpha": 0.7
   }
 }

@@ -4,6 +4,7 @@
 Usage:
     python semantic_search.py --project-dir <path> --query <text>
         [--top-k N] [--threshold F] [--filter-lang <lang>] [--filter-path <glob>]
+        [--mode vector|keyword|hybrid] [--alpha F]
 
 Exit codes:
     0  Success
@@ -17,8 +18,10 @@ import logging
 import sys
 import time
 
+from lib.bm25 import BM25Index
 from lib.config import load_config
 from lib.embedder import Embedder
+from lib.fusion import fuse_results
 from lib.models import ConfigError, EmbeddingError, SemanticIndexError
 from lib.store import VectorStore
 
@@ -48,6 +51,15 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=None, help="Min similarity score (0.0-1.0)")
     parser.add_argument("--filter-lang", default=None, help="Filter by language (e.g., 'python')")
     parser.add_argument("--filter-path", default=None, help="Filter by file path glob (e.g., 'src/**')")
+    parser.add_argument(
+        "--mode", default=None,
+        choices=["vector", "keyword", "hybrid"],
+        help="Search mode: vector, keyword, or hybrid (default from config)",
+    )
+    parser.add_argument(
+        "--alpha", type=float, default=None,
+        help="Hybrid alpha: 0.0 = pure keyword, 1.0 = pure vector (default from config)",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -58,45 +70,103 @@ def main() -> None:
 
     top_k = args.top_k or config.search.default_top_k
     threshold = args.threshold if args.threshold is not None else config.search.default_threshold
+    mode = args.mode or config.search.mode
+    alpha = args.alpha if args.alpha is not None else config.search.hybrid_alpha
 
     try:
-        # Check index exists
+        # Check vector index exists
         store = VectorStore(args.project_dir, config)
-        if not store.has_index():
+        if not store.has_index() and mode in ("vector", "hybrid"):
             _handle_error(
                 SemanticIndexError("No index found. Run build_index.py first to create the index."),
                 exit_code=2,
             )
 
-        # Embed the query
-        embedder = Embedder(config)
         start_time = time.time()
-        query_vector = embedder.embed_query(args.query)
 
-        # Search with over-fetch for filtering
+        # Build filters dict
         filters = {}
         if args.filter_lang:
             filters["language"] = args.filter_lang
         if args.filter_path:
             filters["file_path_glob"] = args.filter_path
+        active_filters = filters if filters else None
 
-        raw_results = store.search(
-            vector=query_vector,
-            top_k=top_k * 2,
-            filters=filters if filters else None,
-        )
+        vector_results: list[dict] = []
+        bm25_results: list[dict] = []
 
-        # Apply threshold and truncate
-        results = [r for r in raw_results if r["score"] >= threshold][:top_k]
+        # --- Vector search ---
+        if mode in ("vector", "hybrid"):
+            embedder = Embedder(config)
+            query_vector = embedder.embed_query(args.query)
+            vector_results = store.search(
+                vector=query_vector,
+                top_k=top_k * 2,
+                filters=active_filters,
+            )
+
+        # --- BM25 keyword search ---
+        if mode in ("keyword", "hybrid"):
+            bm25 = BM25Index(args.project_dir)
+            if bm25.load():
+                bm25_results = bm25.search(
+                    query=args.query,
+                    top_k=top_k * 2,
+                    filters=active_filters,
+                )
+            elif mode == "keyword":
+                _handle_error(
+                    SemanticIndexError(
+                        "No BM25 index found. Run build_index.py first to create the index."
+                    ),
+                    exit_code=2,
+                )
+            else:
+                # Hybrid mode but no BM25 index — fall back to vector only
+                logger.warning("No BM25 index found, falling back to vector-only search")
+
+        # --- Merge results ---
+        if mode == "hybrid" and vector_results and bm25_results:
+            merged = fuse_results(
+                vector_results=vector_results,
+                bm25_results=bm25_results,
+                alpha=alpha,
+            )
+        elif mode == "keyword":
+            merged = bm25_results
+        else:
+            merged = vector_results
+
+        # --- Apply threshold and truncate ---
+        # Each mode uses its own score for thresholding:
+        #   vector mode  -> cosine similarity score (0.0-1.0)
+        #   keyword mode -> BM25 score (0.0-∞, not comparable to vector)
+        #   hybrid mode  -> fused_score from RRF (scale-independent)
+        results = []
+        for r in merged:
+            if mode == "hybrid":
+                score = r.get("fused_score", 0.0)
+            else:
+                score = r.get("score", 0.0)
+
+            # In hybrid mode, threshold is applied to fused_score.
+            # Default threshold (0.3) is designed for vector cosine similarity.
+            # For hybrid, fused_score is much smaller (RRF values), so we
+            # skip thresholding and rely on top_k truncation instead.
+            if mode == "hybrid" or score >= threshold:
+                results.append(r)
+            if len(results) >= top_k:
+                break
 
         duration_ms = (time.time() - start_time) * 1000
 
         output = {
             "query": args.query,
+            "mode": mode,
             "results": [
                 {
                     "rank": i + 1,
-                    "score": r["score"],
+                    "score": r.get("fused_score", r.get("score", 0.0)),
                     "file_path": r["file_path"],
                     "start_line": r["start_line"],
                     "end_line": r["end_line"],
@@ -104,6 +174,8 @@ def main() -> None:
                     "symbol_name": r["symbol_name"],
                     "language": r["language"],
                     "content": r["content"],
+                    **({"vector_score": r["vector_score"], "bm25_score": r["bm25_score"]}
+                       if mode == "hybrid" and "vector_score" in r else {}),
                 }
                 for i, r in enumerate(results)
             ],
