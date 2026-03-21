@@ -422,10 +422,12 @@ def chunk_dita(
             file_path, _MAX_XML_BYTES,
         )
         return []
-    # Reject DTD/entity declarations to prevent entity expansion attacks
-    if "<!DOCTYPE" in content or "<!ENTITY" in content:
+    # Reject entity declarations to prevent entity expansion attacks.
+    # DOCTYPE is safe with ElementTree (it ignores DTDs), and virtually
+    # every valid DITA file has one, so we only block <!ENTITY>.
+    if "<!ENTITY" in content:
         logger.warning(
-            "DITA file %s contains DTD/entity declarations, skipping for safety",
+            "DITA file %s contains entity declarations, skipping for safety",
             file_path,
         )
         return []

@@ -657,16 +657,19 @@ class TestMigrationTypeRobustness:
 # ---------------------------------------------------------------------------
 
 class TestEntityExpansionSafety:
-    """Test that XML with DTD/entity declarations is rejected."""
+    """Test that XML with entity declarations is rejected but DOCTYPE is allowed."""
 
-    def test_doctype_rejected(self, default_config):
+    def test_doctype_allowed(self, default_config):
         xml = (
             '<?xml version="1.0"?>'
             '<!DOCTYPE topic SYSTEM "topic.dtd">'
-            '<topic id="t"><title>T</title><body><p>Content here.</p></body></topic>'
+            '<topic id="t"><title>DOCTYPE Topic</title>'
+            '<body><p>This topic has a standard DOCTYPE declaration which is normal '
+            'for DITA files and should be processed without any issues by the chunker.</p></body></topic>'
         )
         chunks = chunk_dita(xml, "docs/dtd.dita", "dita", default_config)
-        assert chunks == []
+        assert len(chunks) == 1
+        assert chunks[0].content is not None
 
     def test_entity_declaration_rejected(self, default_config):
         xml = (

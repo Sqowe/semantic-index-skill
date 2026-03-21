@@ -1436,6 +1436,271 @@ significant after chunking is parallelized.
   Python-level parallelism to the embedding step would likely cause contention,
   not speedup. Leave embedding single-threaded.
 
+### Phase 9: Office Document Support (PDF, DOCX, PPTX)
+
+**Goal**: Index and search office documents — PDF, Word (.docx), and PowerPoint
+(.pptx) — by extracting their text content and chunking it with format-aware
+strategies. Enables semantic search across project documentation that lives
+outside of code and markdown files.
+
+#### Why This Matters
+
+Many projects have significant knowledge locked in office documents: design specs
+in Word, architecture decks in PowerPoint, compliance docs and research papers in
+PDF. Without indexing these, semantic search has a blind spot — the user asks
+"what are the security requirements?" and gets nothing because the answer lives
+in a PDF, not in code or markdown.
+
+#### Design Constraints
+
+1. **Binary formats** — these are not UTF-8 text files. The pipeline currently
+   assumes `Path.read_text()` in `chunk_file()`. Office documents require binary
+   reading and a text extraction step before chunking.
+2. **No meaningful line numbers** — unlike code and markdown, office documents
+   don't have stable line numbers. We use page numbers (PDF), section indices
+   (DOCX), or slide numbers (PPTX) instead, stored in `start_line`/`end_line`
+   fields for compatibility with the existing `Chunk` schema.
+3. **Optional dependencies** — extraction libraries add ~15-30MB of deps. Like
+   HuggingFace, these go in a separate `requirements-office.txt` to keep the
+   core lightweight. The chunker lazy-imports them and raises a clear error if
+   missing.
+4. **Text-only extraction** — embedded images, charts, and diagrams are skipped.
+   Image captioning (OCR or vision models) is out of scope for this phase.
+5. **Scanned PDFs** — PDFs that contain only images (no text layer) will yield
+   empty text. The chunker logs a warning and skips them. OCR support
+   (`pytesseract` + Tesseract) is a potential future enhancement but not
+   included here due to the heavy system-level dependency.
+
+#### Extraction Libraries
+
+| Format | Library | Why |
+|--------|---------|-----|
+| PDF | `PyMuPDF>=1.24.0` (imported as `fitz`) | C-based, fast, good text extraction with layout awareness. Handles multi-column layouts, headers/footers, and embedded fonts well. ~10MB installed. |
+| DOCX | `python-docx>=1.1.0` | Mature, lightweight, reads paragraphs with style info (headings, body text), tables, and document properties. ~2MB installed. |
+| PPTX | `python-pptx>=1.0.0` | Same ecosystem as python-docx. Reads slides, text frames, tables, speaker notes, and slide layouts. ~3MB installed. |
+
+**Alternative considered for PDF**: `pdfplumber` — better for table extraction
+but slower and less reliable for general text. `PyMuPDF` is the better
+general-purpose choice. If table-heavy PDFs become a problem, `pdfplumber`
+can be added as an optional backend later.
+
+#### Chunking Strategies
+
+**PDF — Page-based splitting:**
+
+```
+document.pdf
+├── Page 1                          →  1 "pdf_page" chunk
+├── Page 2                          →  1 "pdf_page" chunk
+├── Page 3 (very long)              →  split at paragraph boundaries
+├── Pages 4-5 (very short, <min)    →  merged into 1 chunk
+└── Page 6                          →  1 "pdf_page" chunk
+```
+
+Algorithm:
+1. Open PDF with PyMuPDF, extract text per page (`page.get_text("text")`)
+2. Extract document metadata (title, author, subject) from PDF info dict
+3. For each page:
+   - If under `min_tokens` and next page also short → merge with next page
+   - If under `max_tokens` → one chunk
+   - If over `max_tokens` → split at paragraph boundaries (double newlines)
+4. Each chunk gets metadata: `page_number`, `total_pages`, `pdf_title`
+5. `start_line` = first page number in chunk, `end_line` = last page number
+
+**DOCX — Heading-based splitting (mirrors markdown chunker):**
+
+```
+document.docx
+├── [Title] "System Design"         →  metadata (document title)
+├── [Heading 1] "Introduction"      →  1 "docx_section" chunk
+├── [Heading 1] "Architecture"
+│   ├── [Heading 2] "Overview"      →  1 "docx_section" chunk
+│   └── [Heading 2] "Components"    →  1 "docx_section" chunk (if small)
+│       ├── [Heading 3] "Auth"      →  split into multiple if large
+│       └── [Heading 3] "Storage"   →  split into multiple if large
+└── [Heading 1] "Appendix"          →  1 "docx_section" chunk
+```
+
+Algorithm:
+1. Open DOCX with python-docx, iterate paragraphs
+2. Detect heading paragraphs by style name (`Heading 1`, `Heading 2`, etc.)
+3. Group consecutive body paragraphs under their nearest heading
+4. Each heading + its body paragraphs = one chunk (like markdown sections)
+5. If a section exceeds `max_tokens`, split at paragraph boundaries
+6. Extract table text: concatenate cell contents row by row, separated by ` | `
+7. Each chunk gets metadata: `heading_path` (hierarchy), `heading_level`
+8. `start_line` = 1-based section index, `end_line` = same (sections, not lines)
+9. Document core properties (title, author, subject) stored as metadata on
+   all chunks from that file
+
+**PPTX — Slide-based splitting:**
+
+```
+presentation.pptx
+├── Slide 1 "Title Slide"           →  1 "pptx_slide" chunk
+├── Slide 2 "Agenda"                →  1 "pptx_slide" chunk
+├── Slide 3 "Architecture Diagram"  →  1 "pptx_slide" chunk (text only)
+├── Slide 4 (text-heavy)            →  split at text frame boundaries
+└── Slide 5 "Q&A"                   →  skipped (no meaningful text)
+```
+
+Algorithm:
+1. Open PPTX with python-pptx, iterate slides
+2. For each slide, extract text from all shapes (text frames, tables, groups)
+3. Include speaker notes (`slide.notes_slide.notes_text_frame`) if present
+4. Skip slides with no extractable text (image-only slides)
+5. If a slide exceeds `max_tokens`, split at text frame boundaries
+6. Each chunk gets metadata: `slide_number`, `total_slides`, `slide_title`
+   (from the title placeholder if present), `has_notes`
+7. `start_line` = slide number, `end_line` = slide number
+
+#### ChunkType Additions
+
+New enum values in `models.py`:
+
+```python
+class ChunkType(Enum):
+    # ... existing values ...
+    PDF_PAGE = "pdf_page"
+    DOCX_SECTION = "docx_section"
+    PPTX_SLIDE = "pptx_slide"
+```
+
+#### Config Changes
+
+Add office extensions to `file_extensions` in `default-config.json`:
+
+```json
+"file_extensions": [
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".rb", ".php",
+    ".md", ".mdx", ".txt", ".rst",
+    ".dita", ".ditamap",
+    ".pdf", ".docx", ".pptx"
+]
+```
+
+Add office binary extensions to `max_file_size_kb` note: the size limit applies
+to the binary file on disk. A 10MB PPTX with embedded images might yield only
+50KB of searchable text. Consider raising `max_file_size_kb` or adding a separate
+`max_office_file_size_kb` field (default: 50000 = 50MB) since office files are
+inherently larger than source code files.
+
+#### Language Detection
+
+Add to `detect_language()` in `chunkers/common.py`:
+
+```python
+ext_map = {
+    # ... existing entries ...
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".pptx": "pptx",
+}
+```
+
+#### Dispatch Changes in `chunker.py`
+
+The main change: `chunk_file()` currently reads all files as UTF-8 text. For
+office formats, it must skip the text read and pass the binary file path to
+the office chunker, which handles its own file I/O via the extraction library.
+
+```python
+# In chunk_file():
+BINARY_FORMATS = {"pdf", "docx", "pptx"}
+
+language = detect_language(file_path)
+
+if language in BINARY_FORMATS:
+    from .chunkers.office import chunk_office
+    return chunk_office(abs_path, file_path, language, config)
+
+# ... existing text-based dispatch below ...
+content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+```
+
+The office chunker receives the absolute file path (not content) and handles
+binary reading internally. This avoids loading binary data into memory as a
+string.
+
+#### Module Structure
+
+```
+lib/chunkers/
+├── __init__.py
+├── code.py           # existing — Tree-sitter AST
+├── common.py         # existing — shared utilities
+├── dita.py           # existing — DITA XML
+├── markdown.py       # existing — header-based markdown
+└── office.py         # NEW — PDF, DOCX, PPTX extraction + chunking (~250-300 lines)
+```
+
+`office.py` contains:
+- `chunk_office()` — public dispatch: routes to PDF/DOCX/PPTX handler
+- `_chunk_pdf()` — PyMuPDF text extraction + page-based chunking
+- `_chunk_docx()` — python-docx paragraph/heading extraction + section-based chunking
+- `_chunk_pptx()` — python-pptx slide/shape extraction + slide-based chunking
+- `_extract_table_text()` — shared helper for table text in DOCX and PPTX
+- `_merge_short_chunks()` — merge consecutive chunks below `min_tokens`
+
+Each format handler follows the same pattern:
+1. Open file with the extraction library
+2. Extract text segments with positional metadata
+3. Apply chunking logic (merge short, split long)
+4. Return `list[Chunk]` using helpers from `common.py` (`make_chunk_id`,
+   `count_tokens`)
+
+Lazy imports for all three libraries — if the user only has PDFs, `python-docx`
+and `python-pptx` are never imported. If none of the office libraries are
+installed, `chunk_office()` raises a clear `ImportError` with install instructions.
+
+#### Dependencies
+
+```
+# requirements-office.txt
+PyMuPDF>=1.24.0
+python-docx>=1.1.0
+python-pptx>=1.0.0
+```
+
+Installed via `setup.sh --with-office` (same pattern as `--with-huggingface`).
+
+#### What Won't Work Well (Known Limitations)
+
+- **Scanned PDFs** (image-only, no text layer) — yields empty text. Log warning,
+  skip file. OCR is a future enhancement.
+- **Complex table layouts** — text extraction flattens tables into row-by-row
+  text. Good enough for semantic search, not for structural reconstruction.
+- **Embedded images/charts** — invisible to text extraction. A slide with only
+  a diagram and no text produces an empty chunk (skipped).
+- **Password-protected files** — PyMuPDF and python-docx cannot open encrypted
+  files without the password. Log warning, skip file.
+- **Very large files** — a 500-page PDF or 200-slide deck will produce many
+  chunks. The `max_file_size_kb` config (or a new `max_office_file_size_kb`)
+  provides a safety valve.
+- **Formatting loss** — bold, italic, colors, fonts are all stripped. Only raw
+  text is indexed. This is by design — embeddings work on text, not formatting.
+
+#### Implementation Steps
+
+| Step | Task | Details | Status |
+|------|------|---------|--------|
+| 9.1 | Create `requirements-office.txt` | `PyMuPDF>=1.24.0`, `python-docx>=1.1.0`, `python-pptx>=1.0.0` | ⬜ |
+| 9.2 | Update `setup.sh` | Add `--with-office` flag, same pattern as `--with-huggingface` | ⬜ |
+| 9.3 | Add `ChunkType` values | `PDF_PAGE`, `DOCX_SECTION`, `PPTX_SLIDE` in `models.py` | ⬜ |
+| 9.4 | Add office extensions to `detect_language()` | `.pdf`, `.docx`, `.pptx` in `chunkers/common.py` | ⬜ |
+| 9.5 | Add office extensions to `default-config.json` | Append to `file_extensions` array | ⬜ |
+| 9.6 | Update `chunk_file()` dispatch | Binary format detection, skip `read_text()`, delegate to `chunk_office()` | ⬜ |
+| 9.7 | Implement `_chunk_pdf()` | PyMuPDF page extraction, page merging/splitting, metadata | ⬜ |
+| 9.8 | Implement `_chunk_docx()` | python-docx heading-based sectioning, table text, metadata | ⬜ |
+| 9.9 | Implement `_chunk_pptx()` | python-pptx slide extraction, notes, table text, metadata | ⬜ |
+| 9.10 | Implement `chunk_office()` dispatch | Format routing, lazy imports, clear error on missing deps | ⬜ |
+| 9.11 | Add `max_office_file_size_kb` config field | Default 50000 (50MB). Add to `IndexingConfig`, `default-config.json`, `migrate_config.py`. | ⬜ |
+| 9.12 | Update `references/supported-languages.md` | Add office document section with supported formats and limitations | ⬜ |
+| 9.13 | Write tests for office chunker | Test each format with sample files, edge cases (empty, huge, encrypted) | ⬜ |
+| 9.14 | End-to-end test: index + search a project with mixed code and office docs | Verify office chunks appear in search results alongside code/markdown | ⬜ |
+
 ---
 
 ## 11. Reference Script Specs

@@ -53,6 +53,59 @@ After this, your skill directory should look like:
 
 > You can place the skill anywhere you like. The examples below use `~/.kiro/skills/semantic-index` as the skill path. Adjust if you chose a different location.
 
+### Installing / Updating from a Git Clone (Development)
+
+If you're working on the skill itself and want to install or update from your local clone, use one of these approaches. Both skip development artifacts (`.venv`, tests, `__pycache__`, etc.) that shouldn't be in the installed skill.
+
+**Option A — rsync (recommended for repeated dev → install cycles):**
+
+```bash
+rsync -av --delete \
+  --exclude='.venv' \
+  --exclude='__pycache__' \
+  --exclude='.pytest_cache' \
+  --exclude='*.pyc' \
+  --exclude='.DS_Store' \
+  --exclude='tests/' \
+  --exclude='.git' \
+  --exclude='.gitignore' \
+  --exclude='.kiro' \
+  --exclude='docs/' \
+  --exclude='AI.md' \
+  --exclude='AI_SKILL.md' \
+  --exclude='ARCHITECTURE.md' \
+  --exclude='CLAUDE.md' \
+  --exclude='README.md' \
+  semantic-index/ ~/.kiro/skills/semantic-index/
+```
+
+The `--delete` flag removes files from the destination that no longer exist in the source, keeping the installed copy clean.
+
+**Option B — clean copy (simpler, copies only what matters):**
+
+```bash
+rm -rf ~/.kiro/skills/semantic-index
+mkdir -p ~/.kiro/skills/semantic-index
+cp -R semantic-index/SKILL.md \
+      semantic-index/scripts/ \
+      semantic-index/references/ \
+      semantic-index/assets/ \
+      ~/.kiro/skills/semantic-index/
+
+# Clean up any dev artifacts that came along
+rm -rf ~/.kiro/skills/semantic-index/scripts/.venv \
+       ~/.kiro/skills/semantic-index/scripts/__pycache__ \
+       ~/.kiro/skills/semantic-index/scripts/.pytest_cache \
+       ~/.kiro/skills/semantic-index/scripts/lib/__pycache__ \
+       ~/.kiro/skills/semantic-index/scripts/lib/*/__pycache__
+```
+
+After either option, run setup in the installed location:
+
+```bash
+cd ~/.kiro/skills/semantic-index/scripts && bash setup.sh
+```
+
 ### How Skill vs. Index Directories Work
 
 The skill is installed once globally (e.g., `~/.kiro/skills/semantic-index/`) and stays read-only during normal use. The `.index/` directory — containing config, manifest, embedding cache, and LanceDB data — is created inside each project you index via `--project-dir`.
@@ -141,6 +194,16 @@ tests/fixtures/
 data/large-dataset.json
 ```
 
+### Excluding Previously Indexed Directories
+
+If you add a directory to `exclude_patterns` (or `.indexignore`) after it has already been indexed, the next `build_index.py` run will automatically clean up:
+
+1. The file walker skips the now-excluded directory, so those files no longer appear in the current file set.
+2. The change detector compares the current files against the stored manifest and marks any manifest entries missing from the current set as deletions.
+3. The indexer removes the corresponding chunks from both the vector store and the BM25 keyword index, then drops the files from the manifest.
+
+After that run, searches will no longer return results from the excluded directory. No `--full` rebuild is needed — incremental indexing handles it.
+
 ### Local Embedding (HuggingFace Provider)
 
 Instead of calling the OpenRouter API, you can run embeddings locally using sentence-transformers. This is free, works offline, and keeps all data on your machine.
@@ -176,6 +239,65 @@ export SEMANTIC_INDEX_PROVIDER=huggingface
 The `device` field controls where inference runs: `null` (auto-detect: CUDA > MPS > CPU), `"cpu"`, `"cuda"`, or `"mps"`.
 
 **Cross-provider compatibility:** Indexes built with OpenRouter can be searched with HuggingFace and vice versa, as long as the model and dimensions match. The vectors are identical.
+
+### Tuning `embedding.batch_size`
+
+The `batch_size` setting controls how many text chunks are sent to the embedding model in a single call. The right value depends on your hardware, the embedding provider, and the chunk size.
+
+#### What happens during embedding
+
+For each batch, the model must hold in memory:
+
+```
+peak_memory ≈ batch_size × max_sequence_length × hidden_dim × num_layers × bytes_per_param
+```
+
+With `BAAI/bge-m3` (hidden_dim=1024, 12 layers, float32) and `chunking.max_tokens=512`:
+
+| batch_size | Approximate peak memory |
+|------------|------------------------|
+| 4          | ~0.5 GB                |
+| 8          | ~1 GB                  |
+| 16         | ~2 GB                  |
+| 32         | ~4 GB                  |
+| 50         | ~6–8 GB                |
+
+These are rough estimates. Actual usage varies with sequence length (shorter chunks use less), model architecture, and framework overhead. The key insight: memory scales linearly with batch size but quadratically with sequence length (due to self-attention).
+
+#### Recommended values by setup
+
+| Setup | Recommended `batch_size` | Notes |
+|-------|--------------------------|-------|
+| OpenRouter API | `50` (default) | No local memory pressure; limited by API rate limits |
+| NVIDIA GPU (8+ GB VRAM) | `16`–`32` | Monitor with `nvidia-smi`; leave headroom for the model itself |
+| Apple Silicon (16 GB RAM) | `4`–`8` | MPS shares system RAM; OS + model + batches must all fit |
+| Apple Silicon (32+ GB RAM) | `8`–`16` | More headroom, but still conservative vs. dedicated GPU |
+| CPU-only | `4`–`8` | Slower but memory is usually not the bottleneck |
+
+#### How to find the right value for your machine
+
+1. Start with `batch_size: 8` for local HuggingFace inference
+2. Run `build_index.py` on your project and watch memory usage (`Activity Monitor` on macOS, `htop` on Linux, `nvidia-smi` for GPU)
+3. If it completes without issues, try doubling (16, then 32)
+4. If you hit an OOM error, halve the value
+5. The sweet spot is the largest batch size that doesn't OOM, leaving ~20% memory headroom for spikes from unusually long chunks
+
+#### Automatic OOM recovery
+
+If a batch triggers an out-of-memory error during embedding, the indexer automatically splits the failing batch in half and retries each half independently. This continues recursively until the chunks can be embedded. You'll see warnings in stderr like:
+
+```
+WARNING lib.embedder: OOM on batch of 50 chunks, splitting into 25 + 25 and retrying
+```
+
+This means indexing will complete even with an oversized `batch_size`, but at the cost of extra retries. Setting the right value upfront avoids the retry overhead.
+
+#### Quick reference
+
+- Using OpenRouter? Leave `batch_size` at `50` — it's an API call, not local inference
+- Using HuggingFace locally? Start at `8` and tune up from there
+- Getting OOM errors? The auto-retry will handle it, but lower `batch_size` for faster runs
+- Large `chunking.max_tokens` (e.g., 1024)? Use a smaller `batch_size` to compensate
 
 ### Reranking (Cross-Encoder)
 
@@ -523,6 +645,9 @@ Re-run `bash setup.sh` in the `scripts/` directory to ensure the venv is properl
 
 **Slow indexing on first run**
 Large projects (1000+ files) take time on the initial full index. Subsequent runs are incremental and only process changed files.
+
+**OOM error during embedding ("Invalid buffer size" or "out of memory")**
+The embedding batch is too large for your hardware. The indexer will auto-recover by splitting the batch, but for faster runs, lower `embedding.batch_size` in `.index/config.json`. See [Tuning `embedding.batch_size`](#tuning-embeddingbatch_size) for recommended values per device.
 
 **Poor search results**
 - Try smaller `chunking.max_tokens` (more precise chunks) or larger (more context per chunk)
