@@ -17,12 +17,20 @@ logger = logging.getLogger(__name__)
 
 
 def _doc_key(result: dict[str, Any]) -> str:
-    """Extract a stable document key from a result dict."""
+    """Extract a stable document key from a result dict.
+
+    When ``id`` is absent, builds a composite key from file_path,
+    start_line, end_line, and chunk_type to avoid collisions between
+    distinct chunks that share the same start_line.
+    """
     doc_id = result.get("id", "")
     if doc_id:
         return doc_id
-    # Fallback key: file_path + start_line
-    return f"{result['file_path']}:{result['start_line']}"
+    # Fallback key: include end_line and chunk_type to avoid collisions
+    return (
+        f"{result['file_path']}:{result['start_line']}"
+        f":{result.get('end_line', 0)}:{result.get('chunk_type', '')}"
+    )
 
 
 def fuse_results(

@@ -430,6 +430,60 @@ class TestBM25Bootstrap:
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap memory warning tests
+# ---------------------------------------------------------------------------
+
+class TestBootstrapMemoryWarning:
+    """Tests for large-index warning during BM25 bootstrap."""
+
+    def test_large_table_emits_warning(self, tmp_path):
+        """iter_all_chunks warns when row count exceeds threshold."""
+        from unittest.mock import MagicMock, patch, PropertyMock
+        import pyarrow as pa
+
+        from lib.config import Config, EmbeddingConfig
+        from lib.store import VectorStore
+
+        config = Config()
+        config.embedding = EmbeddingConfig(dimensions=4)
+
+        store = VectorStore(str(tmp_path), config)
+
+        # Mock the table to report a large row count
+        mock_table = MagicMock()
+        mock_table.count_rows.return_value = 100_000
+
+        mock_schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("content", pa.string()),
+            pa.field("file_path", pa.string()),
+        ])
+        type(mock_table).schema = PropertyMock(return_value=mock_schema)
+
+        # Make scanner raise AttributeError to test fallback path
+        mock_table.scanner.side_effect = AttributeError("no scanner")
+
+        # Make to_arrow return a minimal table
+        arrow_table = pa.table({
+            "id": ["c1"],
+            "content": ["test"],
+            "file_path": ["a.py"],
+        })
+        mock_table.to_arrow.return_value = arrow_table
+
+        store._table = mock_table
+
+        with patch("lib.store.logger") as mock_logger:
+            batches = list(store.iter_all_chunks(batch_size=100))
+            # Should have emitted a warning about large index
+            warning_calls = [
+                call for call in mock_logger.warning.call_args_list
+                if "Large index" in str(call)
+            ]
+            assert len(warning_calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # Hybrid threshold semantics tests
 # ---------------------------------------------------------------------------
 
@@ -629,6 +683,147 @@ class TestConfigValidation:
             (index_dir / "config.json").write_text(json.dumps(cfg))
             config = load_config(str(tmp_path))
             assert config.search.hybrid_alpha == alpha
+
+
+# ---------------------------------------------------------------------------
+# BM25 zero-term corpus edge case tests
+# ---------------------------------------------------------------------------
+
+class TestBM25ZeroTermCorpus:
+    """Tests for BM25 when all documents tokenize to zero terms."""
+
+    def test_all_docs_zero_tokens_no_crash(self, tmp_path):
+        """Querying a corpus where every doc tokenizes to zero terms does not crash."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        # Chunks whose content is only punctuation/stop words/short tokens
+        zero_term_chunks = [
+            {
+                "id": "z1",
+                "content": "... --- !!!",
+                "file_path": "a.py",
+                "start_line": 1,
+                "end_line": 2,
+                "chunk_type": "unknown",
+            },
+            {
+                "id": "z2",
+                "content": "() {} [] ;; ,,",
+                "file_path": "b.py",
+                "start_line": 1,
+                "end_line": 2,
+                "chunk_type": "unknown",
+            },
+        ]
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(zero_term_chunks)
+
+        # avg_dl should be 0 — search must not crash
+        assert bm25._avg_dl == 0.0
+        results = bm25.search("authenticate user login", top_k=5)
+        assert results == []
+
+    def test_mixed_zero_and_normal_docs(self, tmp_path):
+        """Corpus with a mix of zero-term and normal docs works correctly."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        chunks = [
+            {
+                "id": "z1",
+                "content": "... !!! ???",
+                "file_path": "a.py",
+                "start_line": 1,
+                "end_line": 2,
+                "chunk_type": "unknown",
+            },
+            {
+                "id": "normal_1",
+                "content": "def authenticate_user(username, password):",
+                "file_path": "b.py",
+                "start_line": 1,
+                "end_line": 5,
+                "chunk_type": "function",
+            },
+        ]
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(chunks)
+
+        # avg_dl > 0 because the normal doc has tokens
+        assert bm25._avg_dl > 0
+        results = bm25.search("authenticate", top_k=5)
+        assert len(results) == 1
+        assert results[0]["id"] == "normal_1"
+
+    def test_add_chunks_all_zero_tokens(self, tmp_path):
+        """Incremental add_chunks with zero-term docs doesn't crash on search."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.add_chunks([
+            {
+                "id": "z1",
+                "content": "a + b = c",  # all single-char tokens filtered
+                "file_path": "a.py",
+                "start_line": 1,
+                "end_line": 2,
+                "chunk_type": "unknown",
+            },
+        ])
+
+        results = bm25.search("anything", top_k=5)
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Fusion fallback key collision tests
+# ---------------------------------------------------------------------------
+
+class TestFusionFallbackKeyCollision:
+    """Tests for fusion dedup when id is missing and results share start_line."""
+
+    def test_same_start_line_different_end_line_not_merged(self):
+        """Two results with same file_path:start_line but different end_line stay separate."""
+        vector_results = [
+            {"file_path": "a.py", "start_line": 1, "end_line": 10,
+             "chunk_type": "function", "score": 0.9,
+             "content": "chunk A", "language": "python",
+             "symbol_name": "func_a", "token_count": 20},
+        ]
+        bm25_results = [
+            {"file_path": "a.py", "start_line": 1, "end_line": 25,
+             "chunk_type": "class", "score": 8.0,
+             "content": "chunk B", "language": "python",
+             "symbol_name": "ClassA", "token_count": 40},
+        ]
+
+        merged = fuse_results(vector_results, bm25_results)
+        assert len(merged) == 2, (
+            "Distinct chunks with same start_line but different end_line "
+            "should not be merged"
+        )
+
+    def test_identical_fallback_key_still_dedupes(self):
+        """Two results with identical fallback key fields are correctly deduped."""
+        vector_results = [
+            {"file_path": "a.py", "start_line": 1, "end_line": 10,
+             "chunk_type": "function", "score": 0.9,
+             "content": "from vector", "language": "python",
+             "symbol_name": "f", "token_count": 10},
+        ]
+        bm25_results = [
+            {"file_path": "a.py", "start_line": 1, "end_line": 10,
+             "chunk_type": "function", "score": 5.0,
+             "content": "from bm25", "language": "python",
+             "symbol_name": "f", "token_count": 10},
+        ]
+
+        merged = fuse_results(vector_results, bm25_results)
+        assert len(merged) == 1, "Truly identical chunks should still be deduped"
 
 
 # ---------------------------------------------------------------------------

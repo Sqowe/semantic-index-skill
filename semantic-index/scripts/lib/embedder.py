@@ -11,8 +11,6 @@ providing the same public API used by build_index.py and semantic_search.py.
 import hashlib
 import json
 import logging
-import sys
-import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
@@ -262,11 +260,11 @@ class Embedder:
             batch = uncached[batch_start:batch_start + batch_size]
             texts = [chunk.content for _, chunk in batch]
 
-            print(
-                f"  Embedding batch {batch_start // batch_size + 1}"
-                f"/{(len(uncached) + batch_size - 1) // batch_size}"
-                f" ({len(texts)} chunks)...",
-                file=sys.stderr,
+            logger.info(
+                "Embedding batch %d/%d (%d chunks)...",
+                batch_start // batch_size + 1,
+                (len(uncached) + batch_size - 1) // batch_size,
+                len(texts),
             )
 
             vectors = self._provider.embed_texts(texts)
