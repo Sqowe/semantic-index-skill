@@ -141,6 +141,54 @@ the semantic precision of AST-aware splitting.
 
 ---
 
+## DITA XML Documentation
+
+DITA (Darwin Information Typing Architecture) files use XML-aware chunking
+via Python's built-in `xml.etree.ElementTree`. No Tree-sitter grammar or
+external dependencies are needed.
+
+### Supported Topic Types
+
+| Topic Type | Root Element | Body Element | Description |
+|-----------|-------------|-------------|-------------|
+| Generic topic | `<topic>` | `<body>` | General-purpose topic |
+| Concept | `<concept>` | `<conbody>` | Conceptual/explanatory content |
+| Task | `<task>` | `<taskbody>` | Step-by-step procedures |
+| Reference | `<reference>` | `<refbody>` | Reference tables, APIs, specs |
+| Glossary entry | `<glossentry>` | `<glossBody>` | Term definitions |
+| Troubleshooting | `<troubleshooting>` | `<troublebody>` | Problem/solution pairs |
+| Specializations | Any (with `class` attr) | Varies | Custom topic types extending `topic/topic` |
+
+### Chunking Behavior
+
+- Each topic = one chunk (title + shortdesc + body text, tags stripped)
+- If a topic exceeds `chunk_max_tokens`, splits at `<section>` boundaries
+- `<prolog>` metadata (keywords, audience, category) is prepended as context
+- `xml:lang` attributes are propagated as chunk metadata
+- `conref`/`conkeyref` attributes are noted in metadata (not resolved)
+
+### DITA Map Files (.ditamap)
+
+- `<topicref>` hierarchy is walked to extract navigation structure
+- Produces a single "map overview" chunk with navtitle, href, and keys
+- Useful for queries like "where is the installation guide?"
+
+### Text Extraction Elements
+
+Text is extracted from (in reading order):
+`<title>`, `<shortdesc>`, `<abstract>`, `<p>`, `<li>`, `<sli>`, `<dt>`, `<dd>`,
+`<note>`, `<section>`, `<example>`, `<step>`, `<cmd>`, `<info>`, `<stepresult>`,
+`<result>`, `<prereq>`, `<context>`, `<codeblock>`, `<screen>`, `<msgblock>`,
+`<entry>`, `<stentry>`.
+
+### Skipped Elements
+
+Structural/metadata-only elements are skipped:
+`<prolog>` (extracted separately), `<related-links>`, `<link>`, `<topicmeta>`,
+`<navref>`, `<anchor>`, `<data>`, `<data-about>`, `<foreign>`, `<unknown>`.
+
+---
+
 ## File Extension → Language Mapping
 
 | Extension | Language | Chunking Strategy |
@@ -156,6 +204,8 @@ the semantic precision of AST-aware splitting.
 | `.rb` | Ruby | Tree-sitter AST |
 | `.php` | PHP | Tree-sitter AST |
 | `.md`, `.mdx` | Markdown | Header-based |
+| `.dita` | DITA XML | XML topic-based |
+| `.ditamap` | DITA Map | XML topicref-based |
 | `.txt`, `.rst` | Text | Blank-line fallback |
 
 ---
