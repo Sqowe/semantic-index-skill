@@ -62,6 +62,14 @@ def main() -> None:
         "--alpha", type=float, default=None,
         help="Hybrid alpha: 0.0 = pure keyword, 1.0 = pure vector (default from config)",
     )
+    parser.add_argument(
+        "--rerank", action="store_true", default=None,
+        help="Re-rank results using a cross-encoder model (requires HuggingFace deps)",
+    )
+    parser.add_argument(
+        "--no-rerank", action="store_true", default=False,
+        help="Disable re-ranking even if enabled in config",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -178,6 +186,25 @@ def main() -> None:
             if len(results) >= top_k:
                 break
 
+        # --- Optional reranking ---
+        rerank_enabled = config.search.rerank_enabled
+        if args.rerank:
+            rerank_enabled = True
+        if args.no_rerank:
+            rerank_enabled = False
+
+        if rerank_enabled and results:
+            try:
+                from lib.reranker import Reranker
+                reranker = Reranker(
+                    model_name=config.search.rerank_model,
+                    device=config.embedding.device,
+                )
+                rerank_top_n = config.search.rerank_top_n
+                results = reranker.rerank(args.query, results, top_n=rerank_top_n)
+            except EmbeddingError as exc:
+                logger.warning("Reranking unavailable, skipping: %s", exc)
+
         duration_ms = (time.time() - start_time) * 1000
 
         output = {
@@ -186,7 +213,7 @@ def main() -> None:
             "results": [
                 {
                     "rank": i + 1,
-                    "score": r.get("fused_score", r.get("score", 0.0)),
+                    "score": r.get("rerank_score", r.get("fused_score", r.get("score", 0.0))),
                     "file_path": r["file_path"],
                     "start_line": r["start_line"],
                     "end_line": r["end_line"],
@@ -194,6 +221,8 @@ def main() -> None:
                     "symbol_name": r["symbol_name"],
                     "language": r["language"],
                     "content": r["content"],
+                    **({"rerank_score": r["rerank_score"]}
+                       if "rerank_score" in r else {}),
                     **({"vector_score": r["vector_score"], "bm25_score": r["bm25_score"]}
                        if mode == "hybrid" and "vector_score" in r else {}),
                 }
