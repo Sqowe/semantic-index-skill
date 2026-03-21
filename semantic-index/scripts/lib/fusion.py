@@ -79,10 +79,10 @@ def fuse_results(
         v_score = vector_orig_scores.get(doc_id)
         b_score = bm25_orig_scores.get(doc_id)
 
-        if v_score is not None and b_score is not None:
-            # Both sources have this doc — pick the one with higher score
-            doc = vector_docs[doc_id] if v_score >= b_score else bm25_docs[doc_id]
-        elif v_score is not None:
+        if v_score is not None:
+            # Always prefer vector payload — it comes from the store with
+            # richer metadata. When both sources have the doc, vector wins
+            # deterministically (no cross-modal score comparison).
             doc = vector_docs[doc_id]
         else:
             doc = bm25_docs[doc_id]

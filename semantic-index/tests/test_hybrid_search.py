@@ -7,6 +7,7 @@ Tests cover:
 4. RRF fusion dedup semantics
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -308,12 +309,12 @@ class TestFusion:
             assert "bm25_score" in r
 
     def test_fusion_dedup_picks_higher_score_source(self):
-        """For docs in both sources, the higher original score is used."""
+        """For docs in both sources, vector payload is always preferred."""
         merged = fuse_results(self._make_vector_results(), self._make_bm25_results())
         # chunk_2 has vector_score=0.80 and bm25_score=8.5
-        # BM25 score is higher, so content should come from BM25 source
+        # Vector payload is always preferred (deterministic rule)
         chunk_2 = next(r for r in merged if r["id"] == "chunk_2")
-        assert chunk_2["content"] == "bm25 hit 1"
+        assert chunk_2["content"] == "vector hit 2"
         assert chunk_2["vector_score"] == 0.80
         assert chunk_2["bm25_score"] == 8.5
 
@@ -513,3 +514,237 @@ class TestHybridThresholdSemantics:
         filtered = [r for r in bm25_results if r["score"] >= threshold]
         assert len(filtered) == 1
         assert filtered[0]["id"] == "b1"
+
+
+# ---------------------------------------------------------------------------
+# Fusion deterministic source selection tests
+# ---------------------------------------------------------------------------
+
+class TestFusionSourceSelection:
+    """Tests for deterministic vector-preferred payload selection in fusion."""
+
+    def test_fusion_always_prefers_vector_payload(self):
+        """When a doc appears in both sources, vector payload is always used."""
+        vector_results = [
+            {"id": "dup_1", "score": 0.5, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "from vector", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+        bm25_results = [
+            {"id": "dup_1", "score": 999.0, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "from bm25", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+        merged = fuse_results(vector_results, bm25_results)
+        assert len(merged) == 1
+        # Vector payload always wins, regardless of BM25 having higher raw score
+        assert merged[0]["content"] == "from vector"
+        assert merged[0]["vector_score"] == 0.5
+        assert merged[0]["bm25_score"] == 999.0
+
+
+# ---------------------------------------------------------------------------
+# Config validation tests
+# ---------------------------------------------------------------------------
+
+class TestConfigValidation:
+    """Tests for search config validation at load time."""
+
+    def test_invalid_mode_raises_config_error(self, tmp_path):
+        """Invalid search.mode raises ConfigError."""
+        from lib.config import load_config
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg = {
+            "schema_version": "1.0",
+            "search": {"mode": "turbo", "hybrid_alpha": 0.7},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg))
+
+        with pytest.raises(CfgErr, match="Invalid search.mode"):
+            load_config(str(tmp_path))
+
+    def test_alpha_below_zero_raises_config_error(self, tmp_path):
+        """hybrid_alpha < 0 raises ConfigError."""
+        from lib.config import load_config
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg = {
+            "schema_version": "1.0",
+            "search": {"mode": "hybrid", "hybrid_alpha": -0.1},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg))
+
+        with pytest.raises(CfgErr, match="Invalid search.hybrid_alpha"):
+            load_config(str(tmp_path))
+
+    def test_alpha_above_one_raises_config_error(self, tmp_path):
+        """hybrid_alpha > 1.0 raises ConfigError."""
+        from lib.config import load_config
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg = {
+            "schema_version": "1.0",
+            "search": {"mode": "hybrid", "hybrid_alpha": 1.5},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg))
+
+        with pytest.raises(CfgErr, match="Invalid search.hybrid_alpha"):
+            load_config(str(tmp_path))
+
+    def test_valid_config_passes_validation(self, tmp_path):
+        """Valid mode and alpha values pass without error."""
+        from lib.config import load_config
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg = {
+            "schema_version": "1.0",
+            "search": {"mode": "vector", "hybrid_alpha": 0.0},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg))
+
+        config = load_config(str(tmp_path))
+        assert config.search.mode == "vector"
+        assert config.search.hybrid_alpha == 0.0
+
+    def test_boundary_alpha_values_pass(self, tmp_path):
+        """Alpha at exact boundaries (0.0 and 1.0) passes validation."""
+        from lib.config import load_config
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        for alpha in [0.0, 1.0]:
+            cfg = {
+                "schema_version": "1.0",
+                "search": {"mode": "hybrid", "hybrid_alpha": alpha},
+            }
+            (index_dir / "config.json").write_text(json.dumps(cfg))
+            config = load_config(str(tmp_path))
+            assert config.search.hybrid_alpha == alpha
+
+
+# ---------------------------------------------------------------------------
+# BM25 duplicate doc_id / stale postings tests
+# ---------------------------------------------------------------------------
+
+class TestBM25StalePostings:
+    """Tests for BM25 add_chunks() stale posting cleanup."""
+
+    def test_readd_same_doc_id_no_stale_terms(self, tmp_path):
+        """Re-adding a doc_id with different content purges old terms."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+
+        # Add initial chunk with "alpha beta gamma"
+        bm25.add_chunks([{
+            "id": "doc_1",
+            "content": "alpha beta gamma",
+            "file_path": "a.py",
+            "start_line": 1, "end_line": 5,
+            "chunk_type": "function",
+        }])
+
+        # Verify "alpha" is searchable
+        results = bm25.search("alpha", top_k=5)
+        assert any(r["id"] == "doc_1" for r in results)
+
+        # Re-add same doc_id with completely different content
+        bm25.add_chunks([{
+            "id": "doc_1",
+            "content": "delta epsilon zeta",
+            "file_path": "a.py",
+            "start_line": 1, "end_line": 5,
+            "chunk_type": "function",
+        }])
+
+        # "alpha" should no longer match doc_1 (stale posting purged)
+        results = bm25.search("alpha", top_k=5)
+        assert not any(r["id"] == "doc_1" for r in results)
+
+        # "delta" should now match doc_1
+        results = bm25.search("delta", top_k=5)
+        assert any(r["id"] == "doc_1" for r in results)
+
+        # Doc count should still be 1 (not 2)
+        assert bm25._n_docs == 1
+
+    def test_readd_preserves_other_docs(self, tmp_path):
+        """Re-adding one doc_id doesn't affect other documents."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.add_chunks([
+            {"id": "doc_1", "content": "alpha beta", "file_path": "a.py",
+             "start_line": 1, "end_line": 5, "chunk_type": "function"},
+            {"id": "doc_2", "content": "alpha gamma", "file_path": "b.py",
+             "start_line": 1, "end_line": 5, "chunk_type": "function"},
+        ])
+
+        # Re-add doc_1 with new content
+        bm25.add_chunks([{
+            "id": "doc_1",
+            "content": "delta epsilon",
+            "file_path": "a.py",
+            "start_line": 1, "end_line": 5,
+            "chunk_type": "function",
+        }])
+
+        # doc_2 should still be searchable for "alpha"
+        results = bm25.search("alpha", top_k=5)
+        assert any(r["id"] == "doc_2" for r in results)
+        assert not any(r["id"] == "doc_1" for r in results)
+
+        assert bm25._n_docs == 2
+
+
+# ---------------------------------------------------------------------------
+# BM25 corrupt index recovery tests
+# ---------------------------------------------------------------------------
+
+class TestBM25Recovery:
+    """Tests for BM25 index recovery from corrupt/unreadable files."""
+
+    def test_corrupt_json_returns_false(self, tmp_path):
+        """Unreadable bm25_index.json causes load() to return False."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        (index_dir / "bm25_index.json").write_text("NOT VALID JSON {{{")
+
+        bm25 = BM25Index(str(tmp_path))
+        assert bm25.load() is False
+        assert bm25._n_docs == 0
+
+    def test_empty_file_returns_false(self, tmp_path):
+        """Empty bm25_index.json causes load() to return False."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        (index_dir / "bm25_index.json").write_text("")
+
+        bm25 = BM25Index(str(tmp_path))
+        assert bm25.load() is False
+
+    def test_rebuild_after_corrupt_load(self, tmp_path):
+        """After failed load, index can be rebuilt from scratch."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        (index_dir / "bm25_index.json").write_text("{broken")
+
+        bm25 = BM25Index(str(tmp_path))
+        assert bm25.load() is False
+
+        # Rebuild works fine
+        bm25.build(_make_chunks())
+        assert bm25._n_docs == 5
+        results = bm25.search("authenticate", top_k=3)
+        assert len(results) > 0

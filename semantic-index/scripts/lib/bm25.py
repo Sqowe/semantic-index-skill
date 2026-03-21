@@ -263,14 +263,37 @@ class BM25Index:
         total_length = sum(self._doc_lengths.values())
         self._avg_dl = total_length / self._n_docs if self._n_docs > 0 else 0.0
 
+    def _purge_doc_postings(self, doc_id: str) -> None:
+        """Remove all postings for a single doc_id from the inverted index.
+
+        Args:
+            doc_id: Document ID whose term entries should be removed.
+        """
+        empty_terms: list[str] = []
+        for term, postings in self._postings.items():
+            if doc_id in postings:
+                del postings[doc_id]
+                if not postings:
+                    empty_terms.append(term)
+        for term in empty_terms:
+            del self._postings[term]
+
     def add_chunks(self, chunks: list[dict[str, Any]]) -> None:
         """Incrementally add chunks to the existing index.
+
+        If a chunk with the same doc_id already exists, its old postings
+        are purged before re-indexing to prevent stale term entries.
 
         Args:
             chunks: List of chunk metadata dicts.
         """
         for chunk in chunks:
             doc_id = chunk["id"]
+
+            # Purge stale postings if this doc_id is being re-added
+            if doc_id in self._docs:
+                self._purge_doc_postings(doc_id)
+
             tokens = tokenize(chunk["content"])
             self._doc_lengths[doc_id] = len(tokens)
 

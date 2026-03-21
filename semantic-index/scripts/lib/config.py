@@ -146,6 +146,28 @@ def _apply_env_overrides(config: Config) -> None:
             logger.warning("Invalid SEMANTIC_INDEX_DIMENSIONS: %s (not an integer)", dimensions)
 
 
+_VALID_SEARCH_MODES = {"vector", "keyword", "hybrid"}
+
+
+def _validate_config(config: Config) -> None:
+    """Validate config values after loading and env overrides.
+
+    Raises:
+        ConfigError: If any value is invalid.
+    """
+    if config.search.mode not in _VALID_SEARCH_MODES:
+        raise ConfigError(
+            f"Invalid search.mode: {config.search.mode!r}. "
+            f"Must be one of: {', '.join(sorted(_VALID_SEARCH_MODES))}"
+        )
+
+    if not (0.0 <= config.search.hybrid_alpha <= 1.0):
+        raise ConfigError(
+            f"Invalid search.hybrid_alpha: {config.search.hybrid_alpha}. "
+            "Must be between 0.0 and 1.0 (inclusive)."
+        )
+
+
 def load_config(project_dir: str, config_path: Optional[str] = None) -> Config:
     """Load configuration from JSON file with env var overrides.
 
@@ -190,6 +212,7 @@ def load_config(project_dir: str, config_path: Optional[str] = None) -> Config:
         logger.info("No config found at %s, using defaults", cfg_path)
 
     _apply_env_overrides(config)
+    _validate_config(config)
     return config
 
 

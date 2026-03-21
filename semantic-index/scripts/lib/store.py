@@ -311,8 +311,10 @@ class VectorStore:
     def iter_all_chunks(self, batch_size: int = 500) -> Any:
         """Yield chunks from the store in batches (without vectors).
 
-        Memory-efficient alternative to get_all_chunks() for large repos.
-        Schema-tolerant with the same backfill logic.
+        Memory-efficient: inspects schema without loading data, then
+        selects only non-vector columns and drops the full table reference
+        before iterating. The vector column (bulk of memory) is freed
+        before batch iteration begins.
 
         Args:
             batch_size: Number of rows per batch.
@@ -327,18 +329,18 @@ class VectorStore:
         if table is None:
             return
 
+        # Check schema without loading data
         try:
-            arrow_table = table.to_arrow()
+            schema = table.schema
         except Exception as exc:
-            logger.warning("Failed to read arrow table from store: %s", exc)
+            logger.warning("Failed to read table schema: %s", exc)
             return
 
-        available = set(arrow_table.column_names)
+        available = set(schema.names)
         required = {"id", "content", "file_path"}
         missing_required = required - available
         if missing_required:
-            from .models import IndexingError as IdxErr
-            raise IdxErr(
+            raise IndexingError(
                 f"Vector store schema missing essential columns: {missing_required}. "
                 "Run 'build_index.py --full' to rebuild the index."
             )
@@ -348,19 +350,27 @@ class VectorStore:
             "content", "chunk_type", "language", "symbol_name", "token_count",
         ]
         select_cols = [c for c in desired if c in available]
-        subset = arrow_table.select(select_cols)
+
+        # Load full arrow table, immediately select non-vector columns
+        # (zero-copy column selection), then drop the full table reference
+        # so the vector data can be garbage collected before iteration.
+        try:
+            full_arrow = table.to_arrow()
+            subset = full_arrow.select(select_cols)
+            del full_arrow
+        except Exception as exc:
+            logger.warning("Failed to read arrow table from store: %s", exc)
+            return
 
         defaults = {
             "start_line": 0, "end_line": 0, "chunk_type": "unknown",
             "language": "", "symbol_name": "", "token_count": 0,
         }
 
-        total_rows = subset.num_rows
-        for start in range(0, total_rows, batch_size):
-            end = min(start + batch_size, total_rows)
-            batch = subset.slice(start, end - start).to_pylist()
-            for row in batch:
+        for record_batch in subset.to_batches(max_chunksize=batch_size):
+            rows = record_batch.to_pylist()
+            for row in rows:
                 for field, default in defaults.items():
                     if field not in row:
                         row[field] = default
-            yield batch
+            yield rows
