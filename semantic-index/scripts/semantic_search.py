@@ -48,7 +48,9 @@ def main() -> None:
     parser.add_argument("--project-dir", required=True, help="Project root directory")
     parser.add_argument("--query", required=True, help="Natural language search query")
     parser.add_argument("--top-k", type=int, default=None, help="Max results to return")
-    parser.add_argument("--threshold", type=float, default=None, help="Min similarity score (0.0-1.0)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Min similarity score (0.0-1.0). Applies to vector and keyword modes. "
+                             "Ignored in hybrid mode (RRF scores are not comparable to cosine similarity).")
     parser.add_argument("--filter-lang", default=None, help="Filter by language (e.g., 'python')")
     parser.add_argument("--filter-path", default=None, help="Filter by file path glob (e.g., 'src/**')")
     parser.add_argument(
@@ -72,6 +74,16 @@ def main() -> None:
     threshold = args.threshold if args.threshold is not None else config.search.default_threshold
     mode = args.mode or config.search.mode
     alpha = args.alpha if args.alpha is not None else config.search.hybrid_alpha
+
+    # Validate alpha (config-loaded values are checked by _validate_config,
+    # but CLI --alpha bypasses that path).
+    if not (0.0 <= alpha <= 1.0):
+        _handle_error(
+            ConfigError(
+                f"Invalid --alpha value: {alpha}. Must be between 0.0 and 1.0 (inclusive)."
+            ),
+            exit_code=1,
+        )
 
     try:
         # Check vector index exists
@@ -142,6 +154,18 @@ def main() -> None:
         #   vector mode  -> cosine similarity score (0.0-1.0)
         #   keyword mode -> BM25 score (0.0-∞, not comparable to vector)
         #   hybrid mode  -> fused_score from RRF (scale-independent)
+        #
+        # Hybrid mode skips thresholding because RRF fused_score values
+        # are on a completely different scale from cosine similarity.
+        # The default threshold (0.3) is calibrated for vector cosine
+        # scores and would incorrectly filter most hybrid results.
+        # Hybrid relies on top_k truncation instead.
+        if mode == "hybrid" and args.threshold is not None:
+            logger.warning(
+                "--threshold is ignored in hybrid mode (RRF scores are not "
+                "comparable to cosine similarity). Results are limited by --top-k only."
+            )
+
         results = []
         for r in merged:
             if mode == "hybrid":
@@ -149,10 +173,6 @@ def main() -> None:
             else:
                 score = r.get("score", 0.0)
 
-            # In hybrid mode, threshold is applied to fused_score.
-            # Default threshold (0.3) is designed for vector cosine similarity.
-            # For hybrid, fused_score is much smaller (RRF values), so we
-            # skip thresholding and rely on top_k truncation instead.
             if mode == "hybrid" or score >= threshold:
                 results.append(r)
             if len(results) >= top_k:

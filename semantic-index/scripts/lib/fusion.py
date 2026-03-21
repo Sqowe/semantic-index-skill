@@ -75,14 +75,13 @@ def fuse_results(
 
     results: list[dict[str, Any]] = []
     for doc_id, fused_score in ranked:
-        # For duplicates: pick the source with the higher original score
+        # For duplicates: always prefer vector payload — it comes from the
+        # store with richer metadata. When both sources have the doc,
+        # vector wins deterministically (no cross-modal score comparison).
         v_score = vector_orig_scores.get(doc_id)
         b_score = bm25_orig_scores.get(doc_id)
 
         if v_score is not None:
-            # Always prefer vector payload — it comes from the store with
-            # richer metadata. When both sources have the doc, vector wins
-            # deterministically (no cross-modal score comparison).
             doc = vector_docs[doc_id]
         else:
             doc = bm25_docs[doc_id]

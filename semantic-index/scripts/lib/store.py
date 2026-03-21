@@ -311,10 +311,11 @@ class VectorStore:
     def iter_all_chunks(self, batch_size: int = 500) -> Any:
         """Yield chunks from the store in batches (without vectors).
 
-        Memory-efficient: inspects schema without loading data, then
-        selects only non-vector columns and drops the full table reference
-        before iterating. The vector column (bulk of memory) is freed
-        before batch iteration begins.
+        Selects only non-vector columns and drops the full table reference
+        before iterating, so the vector column can be garbage collected
+        during batch iteration. Note: the initial ``table.to_arrow()``
+        call still materialises the full table briefly, so peak memory
+        may spike on very large indexes.
 
         Args:
             batch_size: Number of rows per batch.
@@ -351,9 +352,12 @@ class VectorStore:
         ]
         select_cols = [c for c in desired if c in available]
 
-        # Load full arrow table, immediately select non-vector columns
-        # (zero-copy column selection), then drop the full table reference
+        # Load full arrow table, then immediately select non-vector columns
+        # (zero-copy column selection) and drop the full table reference
         # so the vector data can be garbage collected before iteration.
+        # NOTE: table.to_arrow() still materialises the entire table
+        # (including vectors) briefly, causing a peak memory spike.
+        # True projection would require LanceDB's scanner API.
         try:
             full_arrow = table.to_arrow()
             subset = full_arrow.select(select_cols)

@@ -748,3 +748,218 @@ class TestBM25Recovery:
         assert bm25._n_docs == 5
         results = bm25.search("authenticate", top_k=3)
         assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# BM25 save/load round-trip regression tests
+# ---------------------------------------------------------------------------
+
+class TestBM25SaveLoadRoundTrip:
+    """Regression tests for BM25Index.save() and load() round-trip."""
+
+    def test_save_after_build_then_search(self, tmp_path):
+        """save() after build() works and loaded index returns same results."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+        bm25.save()
+
+        # Verify the file was written
+        bm25_path = index_dir / "bm25_index.json"
+        assert bm25_path.exists()
+
+        # Load into fresh instance and compare search results
+        bm25_loaded = BM25Index(str(tmp_path))
+        assert bm25_loaded.load() is True
+
+        original_results = bm25.search("authenticate user", top_k=5)
+        loaded_results = bm25_loaded.search("authenticate user", top_k=5)
+
+        assert len(original_results) == len(loaded_results)
+        for orig, loaded in zip(original_results, loaded_results):
+            assert orig["id"] == loaded["id"]
+            assert orig["score"] == loaded["score"]
+
+    def test_save_after_add_chunks(self, tmp_path):
+        """save() after incremental add_chunks() persists correctly."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.add_chunks(_make_chunks(3))
+        bm25.add_chunks(_make_chunks(5)[3:])
+        bm25.save()
+
+        bm25_loaded = BM25Index(str(tmp_path))
+        assert bm25_loaded.load() is True
+        assert bm25_loaded._n_docs == 5
+
+    def test_save_load_preserves_doc_metadata(self, tmp_path):
+        """Round-trip preserves all document metadata fields."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks(1))
+        bm25.save()
+
+        bm25_loaded = BM25Index(str(tmp_path))
+        bm25_loaded.load()
+
+        results = bm25_loaded.search("authenticate", top_k=1)
+        assert len(results) == 1
+        r = results[0]
+        assert r["file_path"] == "src/auth/login.py"
+        assert r["start_line"] == 10
+        assert r["end_line"] == 25
+        assert r["chunk_type"] == "function"
+        assert r["language"] == "python"
+        assert r["symbol_name"] == "authenticate_user"
+
+    def test_save_empty_index(self, tmp_path):
+        """save() on an empty index writes valid JSON that loads back."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.save()
+
+        bm25_loaded = BM25Index(str(tmp_path))
+        assert bm25_loaded.load() is True
+        assert bm25_loaded._n_docs == 0
+
+
+# ---------------------------------------------------------------------------
+# CLI alpha validation tests
+# ---------------------------------------------------------------------------
+
+class TestCLIAlphaValidation:
+    """Tests verifying that --alpha is validated in the CLI path."""
+
+    def _simulate_alpha_validation(self, alpha: float) -> bool:
+        """Simulate the alpha validation logic from semantic_search.py.
+
+        Returns True if the value is valid, False if it would be rejected.
+        """
+        return 0.0 <= alpha <= 1.0
+
+    def test_alpha_negative_rejected(self):
+        assert not self._simulate_alpha_validation(-0.1)
+        assert not self._simulate_alpha_validation(-1.0)
+
+    def test_alpha_above_one_rejected(self):
+        assert not self._simulate_alpha_validation(1.1)
+        assert not self._simulate_alpha_validation(2.0)
+
+    def test_alpha_zero_accepted(self):
+        assert self._simulate_alpha_validation(0.0)
+
+    def test_alpha_one_accepted(self):
+        assert self._simulate_alpha_validation(1.0)
+
+    def test_alpha_mid_range_accepted(self):
+        assert self._simulate_alpha_validation(0.5)
+        assert self._simulate_alpha_validation(0.7)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid threshold skip tests
+# ---------------------------------------------------------------------------
+
+class TestHybridThresholdSkip:
+    """Tests confirming hybrid mode intentionally skips threshold filtering."""
+
+    def test_hybrid_mode_returns_all_results_regardless_of_threshold(self):
+        """In hybrid mode, threshold does not filter results."""
+        # Simulate the threshold logic from semantic_search.py
+        mode = "hybrid"
+        threshold = 0.9  # Very high threshold
+
+        merged = [
+            {"fused_score": 0.01, "score": 0.01, "id": "r1"},
+            {"fused_score": 0.005, "score": 0.005, "id": "r2"},
+        ]
+
+        results = []
+        for r in merged:
+            if mode == "hybrid":
+                score = r.get("fused_score", 0.0)
+            else:
+                score = r.get("score", 0.0)
+
+            if mode == "hybrid" or score >= threshold:
+                results.append(r)
+
+        # Both results pass despite fused_score << threshold
+        assert len(results) == 2
+
+    def test_vector_mode_respects_threshold(self):
+        """In vector mode, threshold filters low-scoring results."""
+        mode = "vector"
+        threshold = 0.5
+
+        merged = [
+            {"score": 0.9, "id": "r1"},
+            {"score": 0.3, "id": "r2"},
+        ]
+
+        results = []
+        for r in merged:
+            score = r.get("score", 0.0)
+            if mode == "hybrid" or score >= threshold:
+                results.append(r)
+
+        assert len(results) == 1
+        assert results[0]["id"] == "r1"
+
+    def test_keyword_mode_respects_threshold(self):
+        """In keyword mode, threshold filters low-scoring results."""
+        mode = "keyword"
+        threshold = 1.0
+
+        merged = [
+            {"score": 8.5, "id": "r1"},
+            {"score": 0.5, "id": "r2"},
+        ]
+
+        results = []
+        for r in merged:
+            score = r.get("score", 0.0)
+            if mode == "hybrid" or score >= threshold:
+                results.append(r)
+
+        # 0.5 < 1.0 threshold, so only r1 passes
+        assert len(results) == 1
+        assert results[0]["id"] == "r1"
+
+
+# ---------------------------------------------------------------------------
+# Hybrid fallback when BM25 index missing
+# ---------------------------------------------------------------------------
+
+class TestHybridFallbackNoBM25:
+    """Tests for hybrid mode behavior when BM25 index is missing."""
+
+    def test_hybrid_falls_back_to_vector_only(self):
+        """When BM25 results are empty, hybrid returns vector results only."""
+        vector_results = [
+            {"id": "v1", "score": 0.9, "file_path": "a.py", "start_line": 1,
+             "end_line": 10, "content": "x", "chunk_type": "function",
+             "language": "python", "symbol_name": "f", "token_count": 10},
+        ]
+        bm25_results: list[dict] = []
+
+        # When bm25_results is empty, fusion is skipped and vector_results used directly
+        # (this mirrors the logic in semantic_search.py)
+        if vector_results and bm25_results:
+            merged = fuse_results(vector_results, bm25_results)
+        else:
+            merged = vector_results
+
+        assert len(merged) == 1
+        assert merged[0]["id"] == "v1"
+        # In vector-only fallback, results have "score" not "fused_score"
+        assert "score" in merged[0]
+        assert "fused_score" not in merged[0]

@@ -119,7 +119,7 @@ class BM25Index:
             tokens = tokenize(chunk["content"])
             self._doc_lengths[doc_id] = len(tokens)
 
-            # Store document metadata (everything except content to save space)
+            # Store document metadata (content included for result output)
             self._docs[doc_id] = {
                 "file_path": chunk["file_path"],
                 "start_line": chunk["start_line"],
