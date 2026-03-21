@@ -89,21 +89,47 @@ class HuggingFaceProvider:
         """Embed a batch of document texts locally.
 
         Adds the document prefix and encodes via sentence-transformers.
+        On OOM (RuntimeError from PyTorch), automatically halves the
+        internal batch size and retries until batch_size reaches 1.
 
         Args:
             texts: Raw text strings to embed.
 
         Returns:
             List of embedding vectors.
+
+        Raises:
+            EmbeddingError: If encoding fails even at batch_size=1.
         """
         prefixed = [self._doc_prefix + t for t in texts]
-        embeddings = self._model.encode(
-            prefixed,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        return embeddings.tolist()
+        batch_size = self._batch_size
+
+        while batch_size >= 1:
+            try:
+                embeddings = self._model.encode(
+                    prefixed,
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                return embeddings.tolist()
+            except RuntimeError as exc:
+                if "Invalid buffer size" not in str(exc) and "out of memory" not in str(exc).lower():
+                    raise
+                new_batch_size = max(1, batch_size // 2)
+                if new_batch_size == batch_size:
+                    # Re-raise the original RuntimeError so the caller
+                    # (Embedder) can split the chunk batch to isolate
+                    # the pathological chunk(s).
+                    raise
+                logger.warning(
+                    "OOM at internal batch_size=%d, retrying with %d: %s",
+                    batch_size, new_batch_size, exc,
+                )
+                batch_size = new_batch_size
+
+        # Unreachable, but satisfies type checkers
+        raise EmbeddingError("Embedding failed after all retries")
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single search query locally.

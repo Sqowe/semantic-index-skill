@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -255,19 +256,51 @@ class Embedder:
                 len(chunks), len(chunks) - len(uncached), len(uncached),
             )
 
-        # Batch embed uncached chunks
+        # Batch embed uncached chunks with OOM-resilient splitting.
+        # If a batch triggers an OOM RuntimeError, it is split in half
+        # and each half is retried independently, recursively halving
+        # until individual chunks are reached.
+        pending_batches: deque[list[tuple[int, Chunk]]] = deque()
         for batch_start in range(0, len(uncached), batch_size):
-            batch = uncached[batch_start:batch_start + batch_size]
+            pending_batches.append(uncached[batch_start:batch_start + batch_size])
+
+        total_batches = len(pending_batches)
+        batch_num = 0
+
+        while pending_batches:
+            batch = pending_batches.popleft()
+            batch_num += 1
             texts = [chunk.content for _, chunk in batch]
 
             logger.info(
                 "Embedding batch %d/%d (%d chunks)...",
-                batch_start // batch_size + 1,
-                (len(uncached) + batch_size - 1) // batch_size,
-                len(texts),
+                batch_num, total_batches, len(texts),
             )
 
-            vectors = self._provider.embed_texts(texts)
+            try:
+                vectors = self._provider.embed_texts(texts)
+            except RuntimeError as exc:
+                err_msg = str(exc).lower()
+                if "invalid buffer size" not in err_msg and "out of memory" not in err_msg:
+                    raise
+                if len(batch) <= 1:
+                    raise EmbeddingError(
+                        f"OOM embedding a single chunk ({len(texts[0])} chars). "
+                        f"Reduce chunking.max_tokens or use a smaller model. "
+                        f"Original error: {exc}"
+                    ) from exc
+                mid = len(batch) // 2
+                logger.warning(
+                    "OOM on batch of %d chunks, splitting into %d + %d and retrying: %s",
+                    len(batch), mid, len(batch) - mid, exc,
+                )
+                # Push the two halves back to the front of the queue
+                pending_batches.appendleft(batch[mid:])
+                pending_batches.appendleft(batch[:mid])
+                total_batches += 1  # one batch became two
+                batch_num -= 1  # re-count since we didn't finish this one
+                continue
+
             api_calls += 1
 
             for (idx, chunk), vector in zip(batch, vectors):
