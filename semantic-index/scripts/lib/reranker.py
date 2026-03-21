@@ -98,10 +98,23 @@ class Reranker:
         if not results:
             return []
 
-        self._ensure_model()
+        # Filter before model load — avoid expensive init for no-op paths
+        valid_results = []
+        pairs = []
+        for r in results:
+            content = r.get("content")
+            if not content:
+                logger.warning("Skipping result %s: missing or empty 'content'", r.get("id", "?"))
+                continue
+            valid_results.append(r)
+            pairs.append((query, content))
 
-        # Build query-document pairs
-        pairs = [(query, r["content"]) for r in results]
+        if not pairs:
+            logger.warning("No results with content to rerank")
+            return []
+
+        self._ensure_model()
+        results = valid_results
 
         # Score all pairs
         scores = self._model.predict(pairs)

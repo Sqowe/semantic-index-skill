@@ -5,6 +5,7 @@ retry with exponential backoff, and rate limit handling.
 """
 
 import logging
+import math
 import time
 from typing import Optional
 
@@ -82,9 +83,22 @@ class OpenRouterProvider:
 
                 # Handle rate limiting
                 if resp.status_code == 429:
-                    retry_after = float(
-                        resp.headers.get("Retry-After", self._retry_delay * (2 ** attempt))
-                    )
+                    fallback_delay = self._retry_delay * (2 ** attempt)
+                    raw_retry = resp.headers.get("Retry-After")
+                    try:
+                        retry_after = float(raw_retry) if raw_retry else fallback_delay
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Non-numeric Retry-After header: %r, using backoff %.1fs",
+                            raw_retry, fallback_delay,
+                        )
+                        retry_after = fallback_delay
+                    if not math.isfinite(retry_after) or retry_after <= 0:
+                        logger.warning(
+                            "Invalid Retry-After value: %r, using backoff %.1fs",
+                            retry_after, fallback_delay,
+                        )
+                        retry_after = fallback_delay
                     logger.warning("Rate limited, retrying in %.1fs", retry_after)
                     time.sleep(retry_after)
                     continue
