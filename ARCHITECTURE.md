@@ -1176,12 +1176,12 @@ pathspec>=0.12.0
 
 **Goal**: Better search results through hybrid search and re-ranking.
 
-| Step | Task |
-|------|------|
-| 3.1 | Add BM25 keyword index alongside vector store |
-| 3.2 | Implement Reciprocal Rank Fusion (RRF) to merge BM25 + vector results |
-| 3.3 | Add optional re-ranking step (cross-encoder model via OpenRouter) |
-| 3.4 | Tunable weights: user can adjust semantic vs. keyword balance |
+| Step | Task | Status |
+|------|------|--------|
+| 3.1 | Add BM25 keyword index alongside vector store | ✅ Done |
+| 3.2 | Implement Reciprocal Rank Fusion (RRF) to merge BM25 + vector results | ✅ Done |
+| 3.3 | ~~Add optional re-ranking step (cross-encoder model via OpenRouter)~~ | ⏩ Moved to Phase 4 (requires local sentence-transformers, no reranking models on OpenRouter) |
+| 3.4 | Tunable weights: user can adjust semantic vs. keyword balance | ✅ Done |
 
 ### Phase 4: HuggingFace Local Embedding Provider
 
@@ -1202,6 +1202,10 @@ OpenRouter, enabling zero-cost, offline, low-latency indexing and search.
 | 4.10 | Add `device` field to config schema and `Config` class | `null` (auto), `"cpu"`, `"cuda"`, `"mps"` |
 | 4.11 | Test: same model produces identical vectors via both providers | Index with OpenRouter, search with HuggingFace (and vice versa) |
 | 4.12 | Update `references/embedding-models.md` | Add local model recommendations, RAM requirements, download sizes |
+| 4.13 | Implement `Reranker` class in `lib/reranker.py` | Uses `sentence_transformers.CrossEncoder` with `BAAI/bge-reranker-v2-m3` for local cross-encoder re-ranking. Lazy import, same optional dep as HuggingFace embedder. |
+| 4.14 | Add rerank config fields to `SearchConfig` | `rerank_enabled: false`, `rerank_model: str`, `rerank_top_n: int`. Only activates when HuggingFace deps are installed. |
+| 4.15 | Integrate reranker into `semantic_search.py` | After RRF fusion, optionally re-rank top-N results via cross-encoder. Add `--rerank` CLI flag. |
+| 4.16 | Update `migrate_config.py` to handle rerank fields | Add rerank fields during config migration when upgrading from Phase 3 to Phase 4. |
 
 **Dependencies (requirements-huggingface.txt):**
 ```
