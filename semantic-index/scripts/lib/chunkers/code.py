@@ -23,6 +23,17 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded parsers cache
 _parsers: dict[str, object] = {}
 
+# Node types treated as class-like containers for oversized splitting.
+# Shared between chunk_code_with_treesitter (is_class) and _node_to_chunk_type
+# to prevent drift.
+CLASS_LIKE_NODES: set[str] = {
+    "impl_item", "trait_item", "struct_item", "enum_item",
+    "struct_specifier", "class_specifier", "enum_specifier",
+    "interface_declaration", "enum_declaration",
+    "record_declaration", "annotation_type_declaration",
+    "trait_declaration", "module", "namespace_definition",
+}
+
 # Tree-sitter node types that represent top-level definitions
 EXTRACTABLE_NODES: dict[str, list[str]] = {
     "python": [
@@ -317,14 +328,30 @@ def _extract_symbol_name(node, language: str) -> Optional[str]:
         return None
 
     # Rust impl blocks: extract the type being implemented
+    # For `impl Type`, return Type.
+    # For `impl Trait for Type`, skip past `for` and return Type.
     if node.type == "impl_item":
-        for child in node.children:
-            if child.type == "type_identifier":
-                return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
-            # impl Trait for Type — grab the Type
-            if child.type == "generic_type" or child.type == "scoped_type_identifier":
-                text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
-                return text
+        children = list(node.children)
+        # Check for `for` keyword indicating trait impl
+        for_index = None
+        for i, child in enumerate(children):
+            if child.type == "for":
+                for_index = i
+                break
+        if for_index is not None:
+            # impl Trait for Type — return the type after `for`
+            for child in children[for_index + 1:]:
+                if child.type in ("type_identifier", "generic_type",
+                                  "scoped_type_identifier"):
+                    text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+                    return text
+        else:
+            # impl Type — return the first type identifier
+            for child in children:
+                if child.type in ("type_identifier", "generic_type",
+                                  "scoped_type_identifier"):
+                    text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+                    return text
         return None
 
     # Go type declarations: type Name struct/interface
@@ -391,11 +418,7 @@ def _node_to_chunk_type(node_type: str, is_method: bool = False) -> ChunkType:
     if "function" in node_type or node_type in ("method", "singleton_method",
                                                   "method_declaration"):
         return ChunkType.FUNCTION
-    if node_type in ("impl_item", "trait_item", "struct_item", "enum_item",
-                      "struct_specifier", "class_specifier", "enum_specifier",
-                      "interface_declaration", "enum_declaration",
-                      "record_declaration", "annotation_type_declaration",
-                      "trait_declaration", "module", "namespace_definition"):
+    if node_type in CLASS_LIKE_NODES:
         return ChunkType.CLASS
     if node_type in (
         "lexical_declaration", "export_statement",
@@ -580,13 +603,7 @@ def chunk_code_with_treesitter(
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
         symbol = _extract_symbol_name(node, language)
-        is_class = "class" in node.type or node.type in (
-            "impl_item", "trait_item", "struct_item", "enum_item",
-            "struct_specifier", "class_specifier", "enum_specifier",
-            "interface_declaration", "enum_declaration",
-            "record_declaration", "trait_declaration", "module",
-            "namespace_definition",
-        )
+        is_class = "class" in node.type or node.type in CLASS_LIKE_NODES
 
         # For classes, try to extract methods as separate chunks
         if is_class and count_tokens(node_text) > max_tokens:
@@ -701,7 +718,7 @@ def _chunk_class_node(
     for child in class_node.children:
         if child.type in ("block", "class_body", "statement_block",
                           "field_declaration_list", "declaration_list",
-                          "body", "enum_body"):
+                          "body", "body_statement", "enum_body"):
             body_node = child
             break
 
@@ -722,6 +739,15 @@ def _chunk_class_node(
                     break
         elif child.type in method_types:
             is_method = True
+        elif language == "cpp" and child.type == "field_declaration":
+            # C++ field_declaration covers both data members and method
+            # declarations. Only treat it as a method if it contains a
+            # function_declarator (i.e., it's a method signature, not a
+            # variable like `int id_;`).
+            for sub in child.children:
+                if sub.type == "function_declarator":
+                    is_method = True
+                    break
 
         if is_method:
             method_text = source_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")

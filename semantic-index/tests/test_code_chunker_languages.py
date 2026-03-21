@@ -689,3 +689,375 @@ class TestTypeScriptRegression:
         types = {c.chunk_type for c in chunks}
         assert ChunkType.FUNCTION in types
         assert ChunkType.CLASS in types
+
+
+# ---------------------------------------------------------------------------
+# Edge-case tests (MR review findings)
+# ---------------------------------------------------------------------------
+
+RUST_TRAIT_IMPL_CODE = '''\
+use std::fmt;
+
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+impl Point {
+    pub fn origin() -> Self {
+        Point { x: 0.0, y: 0.0 }
+    }
+}
+'''
+
+CPP_DESTRUCTOR_CODE = '''\
+#include <string>
+
+class Resource {
+public:
+    Resource(const std::string& name) : name_(name) {}
+    ~Resource() { release(); }
+
+    void use_resource() {
+        // do something
+    }
+
+private:
+    std::string name_;
+    void release() {}
+};
+'''
+
+CPP_OVERSIZED_CLASS_CODE = '''\
+#include <string>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include <map>
+
+class DataProcessor {
+public:
+    DataProcessor(const std::string& name) : name_(name) {}
+
+    void process(const std::vector<int>& data) {
+        for (auto& item : data) {
+            std::cout << "Processing: " << item << std::endl;
+            if (item < 0) {
+                std::cerr << "Negative value: " << item << std::endl;
+            }
+        }
+    }
+
+    void transform(std::vector<int>& data) {
+        std::transform(data.begin(), data.end(), data.begin(),
+                       [](int x) { return x * 2; });
+        for (auto& item : data) {
+            std::cout << "Transformed: " << item << std::endl;
+        }
+    }
+
+    void summarize(const std::vector<int>& data) {
+        int sum = 0;
+        for (auto& item : data) {
+            sum += item;
+        }
+        std::cout << "Sum: " << sum << std::endl;
+        std::cout << "Count: " << data.size() << std::endl;
+        std::cout << "Average: " << (data.empty() ? 0 : sum / static_cast<int>(data.size())) << std::endl;
+    }
+
+    std::string get_name() const;
+
+private:
+    std::string name_;
+    std::map<std::string, int> cache_;
+};
+'''
+
+RUBY_SINGLETON_CODE = '''\
+module Utilities
+  def self.format_name(first, last)
+    "#{first} #{last}".strip
+  end
+
+  def self.validate_email(email)
+    email.include?("@")
+  end
+
+  class Helper
+    def initialize(config)
+      @config = config
+    end
+
+    def run
+      puts "Running with config"
+    end
+  end
+end
+'''
+
+JAVA_ANNOTATION_TYPE_CODE = '''\
+package com.example;
+
+public @interface Validated {
+    String message() default "Invalid";
+    Class<?>[] groups() default {};
+    boolean strict() default true;
+}
+'''
+
+
+class TestRustTraitImplSymbol:
+    """Rust: impl Trait for Type should extract Type, not Trait."""
+
+    def test_trait_impl_extracts_concrete_type(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            RUST_TRAIT_IMPL_CODE, "point.rs", "rust", default_config,
+        )
+        names = [c.symbol_name for c in chunks if c.symbol_name]
+        # impl fmt::Display for Point → symbol should be "Point"
+        assert "Point" in names
+        # Should NOT pick up "Display" or "fmt::Display" as a symbol
+        assert "Display" not in names
+        assert "fmt::Display" not in names
+
+    def test_plain_impl_still_works(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            RUST_TRAIT_IMPL_CODE, "point.rs", "rust", default_config,
+        )
+        # impl Point { ... } should also extract "Point"
+        impl_chunks = [c for c in chunks if c.chunk_type == ChunkType.CLASS]
+        # At least the struct and one impl block
+        assert len(impl_chunks) >= 1
+
+
+class TestCppDestructorExtraction:
+    """C++: destructor names should be extractable."""
+
+    def test_extracts_class_name(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            CPP_DESTRUCTOR_CODE, "resource.cpp", "cpp", default_config,
+        )
+        names = [c.symbol_name for c in chunks if c.symbol_name]
+        assert "Resource" in names
+
+    def test_destructor_in_method_split(self, small_config) -> None:
+        """When class is oversized, destructor should be extracted as a method."""
+        # Use a larger class that exceeds small_config max_tokens (60)
+        big_class = '''\
+#include <string>
+
+class Resource {
+public:
+    Resource(const std::string& name) : name_(name), count_(0) {}
+    ~Resource() {
+        release();
+        std::cout << "Destroyed " << name_ << std::endl;
+    }
+
+    void use_resource() {
+        count_++;
+        std::cout << "Using " << name_ << " count=" << count_ << std::endl;
+    }
+
+    void reset() {
+        count_ = 0;
+        std::cout << "Reset " << name_ << std::endl;
+    }
+
+private:
+    std::string name_;
+    int count_;
+    void release() {
+        std::cout << "Releasing " << name_ << std::endl;
+    }
+};
+'''
+        chunks = chunk_code_with_treesitter(
+            big_class, "resource.cpp", "cpp", small_config,
+        )
+        method_chunks = [c for c in chunks if c.chunk_type == ChunkType.METHOD]
+        assert len(method_chunks) >= 1
+        # Specifically verify the destructor was extracted
+        destructor_found = any(
+            "~Resource" in c.content for c in method_chunks
+        )
+        assert destructor_found, (
+            "Destructor ~Resource not found in method chunks; "
+            f"got symbols: {[c.symbol_name for c in method_chunks]}"
+        )
+
+    def test_data_members_not_extracted_as_methods(self, small_config) -> None:
+        """Data members (e.g., std::string name_) must NOT become METHOD chunks."""
+        big_class = '''\
+#include <string>
+
+class Resource {
+public:
+    Resource(const std::string& name) : name_(name), count_(0) {}
+    ~Resource() {
+        release();
+        std::cout << "Destroyed " << name_ << std::endl;
+    }
+
+    void use_resource() {
+        count_++;
+        std::cout << "Using " << name_ << " count=" << count_ << std::endl;
+    }
+
+    void reset() {
+        count_ = 0;
+        std::cout << "Reset " << name_ << std::endl;
+    }
+
+private:
+    std::string name_;
+    int count_;
+    void release() {
+        std::cout << "Releasing " << name_ << std::endl;
+    }
+};
+'''
+        chunks = chunk_code_with_treesitter(
+            big_class, "resource.cpp", "cpp", small_config,
+        )
+        method_chunks = [c for c in chunks if c.chunk_type == ChunkType.METHOD]
+        for mc in method_chunks:
+            # A method chunk should not be just a data member
+            content = mc.content.strip()
+            assert not content.startswith("std::string name_"), (
+                f"Data member extracted as METHOD: {content!r}"
+            )
+            assert not content.startswith("int count_"), (
+                f"Data member extracted as METHOD: {content!r}"
+            )
+
+
+class TestCppOversizedClassMethodExtraction:
+    """C++: oversized class should split into methods including declarations."""
+
+    def test_method_extraction(self, small_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            CPP_OVERSIZED_CLASS_CODE, "processor.cpp", "cpp", small_config,
+        )
+        method_chunks = [c for c in chunks if c.chunk_type == ChunkType.METHOD]
+        assert len(method_chunks) >= 2
+
+    def test_field_declaration_extracted(self, small_config) -> None:
+        """field_declaration methods (e.g., 'get_name() const;') should be
+        recognized as methods during oversized class splitting, but data
+        members should not."""
+        chunks = chunk_code_with_treesitter(
+            CPP_OVERSIZED_CLASS_CODE, "processor.cpp", "cpp", small_config,
+        )
+        method_chunks = [c for c in chunks if c.chunk_type == ChunkType.METHOD]
+        # The class should be split — check we get more than one chunk
+        class_related = [c for c in chunks
+                         if c.chunk_type in (ChunkType.CLASS, ChunkType.METHOD)]
+        assert len(class_related) >= 2
+        # Verify declaration-only method get_name is in a method chunk
+        decl_found = any("get_name" in c.content for c in method_chunks)
+        assert decl_found, (
+            "Declaration-only method 'get_name() const;' not extracted; "
+            f"method contents: {[c.content[:40] for c in method_chunks]}"
+        )
+        # Verify data members are NOT method chunks
+        for mc in method_chunks:
+            assert "std::map<std::string, int> cache_" not in mc.content or \
+                   "(" in mc.content, (
+                f"Data member extracted as METHOD: {mc.content[:60]!r}"
+            )
+
+
+class TestRubySingletonMethods:
+    """Ruby: singleton methods (self.method) at module level."""
+
+    def test_extracts_module(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            RUBY_SINGLETON_CODE, "utilities.rb", "ruby", default_config,
+        )
+        names = [c.symbol_name for c in chunks if c.symbol_name]
+        assert "Utilities" in names
+
+    def test_singleton_methods_in_content(self, default_config) -> None:
+        """Singleton methods should appear in the module chunk content."""
+        chunks = chunk_code_with_treesitter(
+            RUBY_SINGLETON_CODE, "utilities.rb", "ruby", default_config,
+        )
+        module_chunk = next(c for c in chunks if c.symbol_name == "Utilities")
+        assert "format_name" in module_chunk.content
+        assert "validate_email" in module_chunk.content
+
+    def test_method_extraction_on_oversized(self, small_config) -> None:
+        """When module is oversized, singleton methods should be extracted."""
+        chunks = chunk_code_with_treesitter(
+            RUBY_SINGLETON_CODE, "utilities.rb", "ruby", small_config,
+        )
+        method_chunks = [c for c in chunks if c.chunk_type == ChunkType.METHOD]
+        assert len(method_chunks) >= 1
+
+
+class TestJavaAnnotationType:
+    """Java: annotation_type_declaration should be treated as class-like."""
+
+    def test_extracts_annotation_type(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            JAVA_ANNOTATION_TYPE_CODE, "Validated.java", "java", default_config,
+        )
+        names = [c.symbol_name for c in chunks if c.symbol_name]
+        assert "Validated" in names
+
+    def test_annotation_type_is_class_like(self, default_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            JAVA_ANNOTATION_TYPE_CODE, "Validated.java", "java", default_config,
+        )
+        annotation_chunk = next(
+            c for c in chunks if c.symbol_name == "Validated"
+        )
+        assert annotation_chunk.chunk_type == ChunkType.CLASS
+
+
+class TestGrammarFallback:
+    """Verify graceful fallback when grammar is unavailable."""
+
+    def test_unknown_language_falls_back(self, default_config) -> None:
+        """A language with no grammar should produce fallback chunks."""
+        code = "fn main() {\n    println!(\"hello\");\n}\n\nfn other() {\n    println!(\"world\");\n}\n"
+        chunks = chunk_code_with_treesitter(
+            code, "main.zig", "zig", default_config,
+        )
+        # Should fall back to text splitting, producing at least one chunk
+        assert len(chunks) >= 1
+        # All chunks should be UNKNOWN type (fallback)
+        for chunk in chunks:
+            assert chunk.chunk_type == ChunkType.UNKNOWN
+
+    def test_fallback_preserves_content(self, default_config) -> None:
+        """Fallback chunks should contain the original content."""
+        code = (
+            "package main\n\n"
+            "import \"fmt\"\n"
+            "import \"os\"\n"
+            "import \"strings\"\n\n"
+            "func hello() {\n"
+            "    fmt.Println(\"hi\")\n"
+            "    fmt.Println(\"hello world\")\n"
+            "    name := os.Getenv(\"USER\")\n"
+            "    fmt.Println(strings.ToUpper(name))\n"
+            "}\n\n"
+            "func goodbye() {\n"
+            "    fmt.Println(\"bye\")\n"
+            "    fmt.Println(\"see you later\")\n"
+            "}\n"
+        )
+        chunks = chunk_code_with_treesitter(
+            code, "main.zig", "zig", default_config,
+        )
+        combined = " ".join(c.content for c in chunks)
+        assert "hello" in combined
