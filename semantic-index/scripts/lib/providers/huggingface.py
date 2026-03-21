@@ -48,6 +48,9 @@ class HuggingFaceProvider:
         self._query_prefix = config.embedding.query_prefix
         self._batch_size = config.embedding.batch_size
         self._device: Optional[str] = config.embedding.device
+        self._trust_remote_code: bool = getattr(
+            config.embedding, "trust_remote_code", False,
+        )
 
         print(
             f"Loading embedding model {self._model_id}...",
@@ -56,13 +59,23 @@ class HuggingFaceProvider:
         try:
             self._model = SentenceTransformer(
                 self._model_id,
-                trust_remote_code=True,
+                trust_remote_code=self._trust_remote_code,
                 device=self._device,  # None → auto (CUDA > MPS > CPU)
             )
         except Exception as exc:
             raise EmbeddingError(
                 f"Failed to load model {self._model_id}: {exc}"
             ) from exc
+
+        # Validate dimensions: model's actual output must match config
+        actual_dim = self._model.get_sentence_embedding_dimension()
+        if actual_dim != self._dimensions:
+            raise EmbeddingError(
+                f"Dimension mismatch: model {self._model_id} produces "
+                f"{actual_dim}-d vectors, but config specifies "
+                f"embedding.dimensions={self._dimensions}. "
+                f"Update config to match the model's native dimensions."
+            )
 
         actual_device = str(self._model.device)
         logger.info(

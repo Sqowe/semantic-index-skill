@@ -199,6 +199,7 @@ def main() -> None:
                 reranker = Reranker(
                     model_name=config.search.rerank_model,
                     device=config.embedding.device,
+                    trust_remote_code=config.embedding.trust_remote_code,
                 )
                 rerank_top_n = config.search.rerank_top_n
                 results = reranker.rerank(args.query, results, top_n=rerank_top_n)

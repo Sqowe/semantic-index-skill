@@ -36,9 +36,11 @@ class Reranker:
         self,
         model_name: str = "BAAI/bge-reranker-v2-m3",
         device: Optional[str] = None,
+        trust_remote_code: bool = False,
     ) -> None:
         self._model_name = model_name
         self._device = device
+        self._trust_remote_code = trust_remote_code
         self._model = None  # Lazy-loaded
 
     def _ensure_model(self) -> None:
@@ -63,7 +65,7 @@ class Reranker:
             self._model = CrossEncoder(
                 self._model_name,
                 device=self._device,
-                trust_remote_code=True,
+                trust_remote_code=self._trust_remote_code,
             )
         except Exception as exc:
             raise EmbeddingError(

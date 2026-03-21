@@ -10,7 +10,8 @@
     "document_prefix": "",
     "max_retries": 3,
     "retry_delay_seconds": 1.0,
-    "device": null
+    "device": null,
+    "trust_remote_code": false
   },
   "chunking": {
     "max_tokens": 512,
