@@ -130,8 +130,11 @@ def analyze_config(config: dict) -> list[dict]:
     # Check for missing DITA file extensions (Phase 5)
     indexing = config.get("indexing", {})
     file_extensions = indexing.get("file_extensions")
-    if file_extensions is None:
-        file_extensions = []
+    if not isinstance(file_extensions, list):
+        if isinstance(file_extensions, str):
+            file_extensions = [file_extensions]
+        else:
+            file_extensions = list(file_extensions) if file_extensions else []
     dita_extensions = [".dita", ".ditamap"]
     missing_dita = [ext for ext in dita_extensions if ext not in file_extensions]
     if missing_dita:
