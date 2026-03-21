@@ -190,6 +190,38 @@ def _validate_config(config: Config) -> None:
             "Must be between 0.0 and 1.0 (inclusive)."
         )
 
+    # Numeric range validation for embedding settings
+    if config.embedding.max_retries < 1:
+        raise ConfigError(
+            f"Invalid embedding.max_retries: {config.embedding.max_retries}. "
+            "Must be >= 1."
+        )
+
+    if config.embedding.batch_size < 1:
+        raise ConfigError(
+            f"Invalid embedding.batch_size: {config.embedding.batch_size}. "
+            "Must be >= 1."
+        )
+
+    if config.embedding.retry_delay_seconds < 0:
+        raise ConfigError(
+            f"Invalid embedding.retry_delay_seconds: {config.embedding.retry_delay_seconds}. "
+            "Must be >= 0."
+        )
+
+    # Numeric range validation for search settings
+    if config.search.default_top_k < 1:
+        raise ConfigError(
+            f"Invalid search.default_top_k: {config.search.default_top_k}. "
+            "Must be >= 1."
+        )
+
+    if config.search.rerank_top_n < 1:
+        raise ConfigError(
+            f"Invalid search.rerank_top_n: {config.search.rerank_top_n}. "
+            "Must be >= 1."
+        )
+
 
 def load_config(project_dir: str, config_path: Optional[str] = None) -> Config:
     """Load configuration from JSON file with env var overrides.

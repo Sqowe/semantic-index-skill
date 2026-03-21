@@ -412,6 +412,64 @@ class TestMigrationTrustRemoteCode:
 
 
 # ---------------------------------------------------------------------------
+# trust_remote_code warning emission tests
+# ---------------------------------------------------------------------------
+
+class TestTrustRemoteCodeWarning:
+    """Tests that enabling trust_remote_code emits an explicit warning."""
+
+    def test_trust_true_emits_warning(self, mock_sentence_transformers):
+        """When trust_remote_code=True, a warning is logged."""
+        mock_model = MagicMock()
+        mock_model.get_sentence_embedding_dimension.return_value = 1024
+        mock_model.device = "cpu"
+        mock_sentence_transformers.SentenceTransformer.return_value = mock_model
+
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="huggingface",
+            model="test-model",
+            dimensions=1024,
+            trust_remote_code=True,
+        )
+
+        with patch("lib.providers.huggingface.logger") as mock_logger:
+            from lib.providers.huggingface import HuggingFaceProvider
+            HuggingFaceProvider(config)
+
+            warning_calls = [
+                call for call in mock_logger.warning.call_args_list
+                if "trust_remote_code" in str(call)
+            ]
+            assert len(warning_calls) == 1
+
+    def test_trust_false_no_warning(self, mock_sentence_transformers):
+        """When trust_remote_code=False, no trust warning is logged."""
+        mock_model = MagicMock()
+        mock_model.get_sentence_embedding_dimension.return_value = 1024
+        mock_model.device = "cpu"
+        mock_sentence_transformers.SentenceTransformer.return_value = mock_model
+
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="huggingface",
+            model="test-model",
+            dimensions=1024,
+            trust_remote_code=False,
+        )
+
+        with patch("lib.providers.huggingface.logger") as mock_logger:
+            from lib.providers.huggingface import HuggingFaceProvider
+            HuggingFaceProvider(config)
+
+            warning_calls = [
+                call for call in mock_logger.warning.call_args_list
+                if "trust_remote_code" in str(call)
+            ]
+            assert len(warning_calls) == 0
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter Retry-After header edge cases
 # ---------------------------------------------------------------------------
 

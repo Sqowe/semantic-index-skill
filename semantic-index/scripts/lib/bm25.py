@@ -174,6 +174,12 @@ class BM25Index:
         if not query_tokens:
             return []
 
+        # If all documents tokenized to zero terms, no meaningful keyword
+        # scoring is possible — return empty rather than dividing by zero.
+        if self._avg_dl <= 0.0:
+            logger.debug("Average doc length is zero; skipping BM25 scoring")
+            return []
+
         # Score each document
         scores: dict[str, float] = {}
 

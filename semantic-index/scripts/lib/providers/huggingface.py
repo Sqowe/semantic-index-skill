@@ -9,7 +9,6 @@ Override with the `device` config field or leave null for auto.
 """
 
 import logging
-import sys
 from typing import Optional
 
 from ..models import EmbeddingError
@@ -52,10 +51,14 @@ class HuggingFaceProvider:
             config.embedding, "trust_remote_code", False,
         )
 
-        print(
-            f"Loading embedding model {self._model_id}...",
-            file=sys.stderr,
-        )
+        if self._trust_remote_code:
+            logger.warning(
+                "trust_remote_code is enabled for model %s. "
+                "This allows the model repository to execute arbitrary code.",
+                self._model_id,
+            )
+
+        logger.info("Loading embedding model %s...", self._model_id)
         try:
             self._model = SentenceTransformer(
                 self._model_id,
@@ -80,10 +83,6 @@ class HuggingFaceProvider:
         actual_device = str(self._model.device)
         logger.info(
             "Loaded %s on device: %s", self._model_id, actual_device,
-        )
-        print(
-            f"Model loaded on device: {actual_device}",
-            file=sys.stderr,
         )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:

@@ -311,11 +311,12 @@ class VectorStore:
     def iter_all_chunks(self, batch_size: int = 500) -> Any:
         """Yield chunks from the store in batches (without vectors).
 
-        Selects only non-vector columns and drops the full table reference
-        before iterating, so the vector column can be garbage collected
-        during batch iteration. Note: the initial ``table.to_arrow()``
-        call still materialises the full table briefly, so peak memory
-        may spike on very large indexes.
+        Attempts to use LanceDB's scanner API for column projection to
+        avoid materializing the full vector column. Falls back to loading
+        the full table if the scanner API is unavailable.
+
+        Emits a warning when the table exceeds a size threshold, since
+        the fallback path can cause memory spikes on large indexes.
 
         Args:
             batch_size: Number of rows per batch.
@@ -352,12 +353,45 @@ class VectorStore:
         ]
         select_cols = [c for c in desired if c in available]
 
-        # Load full arrow table, then immediately select non-vector columns
-        # (zero-copy column selection) and drop the full table reference
-        # so the vector data can be garbage collected before iteration.
-        # NOTE: table.to_arrow() still materialises the entire table
-        # (including vectors) briefly, causing a peak memory spike.
-        # True projection would require LanceDB's scanner API.
+        defaults = {
+            "start_line": 0, "end_line": 0, "chunk_type": "unknown",
+            "language": "", "symbol_name": "", "token_count": 0,
+        }
+
+        # Warn on large tables — the fallback path materializes vectors
+        _LARGE_TABLE_THRESHOLD = 50_000
+        try:
+            row_count = table.count_rows()
+            if row_count > _LARGE_TABLE_THRESHOLD:
+                logger.warning(
+                    "Large index detected (%d rows). Bootstrap may use "
+                    "significant memory. Consider running "
+                    "'build_index.py --full' instead.",
+                    row_count,
+                )
+        except Exception:
+            row_count = None
+
+        # Try scanner-based projection first (avoids loading vectors)
+        try:
+            scanner = table.scanner(columns=select_cols, batch_size=batch_size)
+            for record_batch in scanner.to_batches():
+                rows = record_batch.to_pylist()
+                for row in rows:
+                    for field, default in defaults.items():
+                        if field not in row:
+                            row[field] = default
+                yield rows
+            return  # Scanner path succeeded — skip fallback
+        except (AttributeError, TypeError):
+            # LanceDB version doesn't support scanner() with columns kwarg
+            logger.debug("Scanner API unavailable, falling back to to_arrow()")
+        except Exception as exc:
+            logger.debug("Scanner failed (%s), falling back to to_arrow()", exc)
+
+        # Fallback: load full arrow table, then select non-vector columns.
+        # NOTE: table.to_arrow() materialises the entire table (including
+        # vectors) briefly, causing a peak memory spike on large indexes.
         try:
             full_arrow = table.to_arrow()
             subset = full_arrow.select(select_cols)
@@ -365,11 +399,6 @@ class VectorStore:
         except Exception as exc:
             logger.warning("Failed to read arrow table from store: %s", exc)
             return
-
-        defaults = {
-            "start_line": 0, "end_line": 0, "chunk_type": "unknown",
-            "language": "", "symbol_name": "", "token_count": 0,
-        }
 
         for record_batch in subset.to_batches(max_chunksize=batch_size):
             rows = record_batch.to_pylist()
