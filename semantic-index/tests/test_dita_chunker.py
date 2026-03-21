@@ -100,10 +100,11 @@ NAMESPACED_TOPIC = """\
 TOPIC_WITH_CONREF = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <concept id="reuse">
-  <title>Reusable Content</title>
+  <title>Reusable Content Topic</title>
   <conbody>
-    <p conref="shared/common.dita#common/intro">Placeholder for reused content.</p>
-    <p>Local content that is not reused from another file.</p>
+    <p conref="shared/common.dita#common/intro">Placeholder for reused content that will be pulled from another file at build time.</p>
+    <p>Local content that is not reused from another file and provides additional context for the reader.</p>
+    <p>This paragraph adds enough words to ensure the topic exceeds the minimum token threshold for chunking.</p>
   </conbody>
 </concept>
 """
@@ -502,3 +503,176 @@ class TestMigrationDitaExtensions:
         migrations = analyze_config(config)
         dita_mig = [m for m in migrations if "DITA" in m.get("reason", "")]
         assert len(dita_mig) == 0
+
+
+# ---------------------------------------------------------------------------
+# Oversized section fixtures
+# ---------------------------------------------------------------------------
+
+def _make_huge_section(word_count: int) -> str:
+    """Generate a DITA section with approximately word_count words."""
+    words = " ".join(f"word{i}" for i in range(word_count))
+    return f"<section><title>Huge Section</title><p>{words}</p></section>"
+
+
+def _make_large_ditamap(ref_count: int) -> str:
+    """Generate a ditamap with ref_count topicrefs."""
+    refs = "\n".join(
+        f'  <topicref href="topic{i}.dita" navtitle="Topic Number {i} Title"/>'
+        for i in range(ref_count)
+    )
+    return f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<map>
+  <title>Large Map</title>
+{refs}
+</map>
+"""
+
+
+TOPIC_WITH_HUGE_SECTION = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<concept id="huge">
+  <title>Huge Section Topic</title>
+  <conbody>
+{_make_huge_section(800)}
+  </conbody>
+</concept>
+"""
+
+
+# ---------------------------------------------------------------------------
+# max_tokens enforcement
+# ---------------------------------------------------------------------------
+
+class TestMaxTokensEnforcement:
+    """Test that chunks never exceed max_tokens."""
+
+    def test_oversized_section_capped(self, small_config):
+        """A section with 800 words should be truncated to fit max_tokens."""
+        chunks = chunk_dita(
+            TOPIC_WITH_HUGE_SECTION, "docs/huge.dita", "dita", small_config,
+        )
+        assert len(chunks) >= 1
+        for chunk in chunks:
+            assert chunk.token_count <= small_config.chunking.max_tokens
+
+    def test_oversized_section_has_truncated_flag(self, small_config):
+        chunks = chunk_dita(
+            TOPIC_WITH_HUGE_SECTION, "docs/huge.dita", "dita", small_config,
+        )
+        truncated = [c for c in chunks if c.metadata.get("truncated")]
+        assert len(truncated) >= 1
+
+    def test_large_ditamap_capped(self, small_config):
+        """A ditamap with 200 topicrefs should be truncated."""
+        xml = _make_large_ditamap(200)
+        chunks = chunk_dita(xml, "docs/big.ditamap", "ditamap", small_config)
+        assert len(chunks) == 1
+        assert chunks[0].token_count <= small_config.chunking.max_tokens
+
+    def test_large_ditamap_has_truncated_flag(self, small_config):
+        xml = _make_large_ditamap(200)
+        chunks = chunk_dita(xml, "docs/big.ditamap", "ditamap", small_config)
+        assert chunks[0].metadata.get("truncated") is True
+
+
+# ---------------------------------------------------------------------------
+# XML safety guard
+# ---------------------------------------------------------------------------
+
+class TestXMLSafetyGuard:
+    """Test that oversized XML content is rejected gracefully."""
+
+    def test_oversized_xml_returns_empty(self, default_config):
+        """Content exceeding 10 MB safety limit should return []."""
+        huge_xml = '<?xml version="1.0"?><topic id="x"><title>X</title><body>'
+        huge_xml += "<p>" + ("A " * 6_000_000) + "</p>"
+        huge_xml += "</body></topic>"
+        chunks = chunk_dita(huge_xml, "docs/bomb.dita", "dita", default_config)
+        assert chunks == []
+
+
+# ---------------------------------------------------------------------------
+# Line approximate metadata
+# ---------------------------------------------------------------------------
+
+class TestLineApproximateMetadata:
+    """Test that chunks include line_approximate flag."""
+
+    def test_topic_has_line_approximate(self, default_config):
+        chunks = chunk_dita(CONCEPT_TOPIC, "docs/about.dita", "dita", default_config)
+        assert chunks[0].metadata.get("line_approximate") is True
+
+    def test_ditamap_has_line_approximate(self, default_config):
+        chunks = chunk_dita(DITAMAP_BASIC, "docs/product.ditamap", "ditamap", default_config)
+        assert chunks[0].metadata.get("line_approximate") is True
+
+
+# ---------------------------------------------------------------------------
+# Migration type robustness
+# ---------------------------------------------------------------------------
+
+class TestMigrationTypeRobustness:
+    """Test that migration handles non-list file_extensions gracefully."""
+
+    def test_string_extensions_normalized(self):
+        from scripts.migrate_config import analyze_config
+        config = {
+            "schema_version": "1.0",
+            "indexing": {"file_extensions": ".py"},
+            "search": dict(
+                default_top_k=10, default_threshold=0.3, mode="hybrid",
+                hybrid_alpha=0.7, rerank_enabled=False,
+                rerank_model="BAAI/bge-reranker-v2-m3", rerank_top_n=10,
+            ),
+            "embedding": {"device": None, "trust_remote_code": False},
+        }
+        migrations = analyze_config(config)
+        dita_mig = [m for m in migrations if "DITA" in m.get("reason", "")]
+        assert len(dita_mig) == 1
+        assert isinstance(dita_mig[0]["new_value"], list)
+
+
+    def test_single_line_oversize_truncated(self):
+        """A single very long line with no newlines must still be capped."""
+        from lib.chunkers.dita import chunk_dita
+        from lib.config import Config, ChunkingConfig
+        cfg = Config()
+        cfg.chunking = ChunkingConfig(max_tokens=30, overlap_tokens=5, min_tokens=5)
+        words = " ".join(f"word{i}" for i in range(500))
+        xml = (
+            '<?xml version="1.0"?>'
+            f'<topic id="t"><title>T</title><body><p>{words}</p></body></topic>'
+        )
+        chunks = chunk_dita(xml, "docs/long.dita", "dita", cfg)
+        assert len(chunks) >= 1
+        for chunk in chunks:
+            assert chunk.token_count <= cfg.chunking.max_tokens
+            assert chunk.metadata.get("truncated") is True or chunk.token_count <= 30
+
+
+# ---------------------------------------------------------------------------
+# Entity expansion safety
+# ---------------------------------------------------------------------------
+
+class TestEntityExpansionSafety:
+    """Test that XML with DTD/entity declarations is rejected."""
+
+    def test_doctype_rejected(self, default_config):
+        xml = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE topic SYSTEM "topic.dtd">'
+            '<topic id="t"><title>T</title><body><p>Content here.</p></body></topic>'
+        )
+        chunks = chunk_dita(xml, "docs/dtd.dita", "dita", default_config)
+        assert chunks == []
+
+    def test_entity_declaration_rejected(self, default_config):
+        xml = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE foo [<!ENTITY xxe "expanded">]>'
+            '<topic id="t"><title>T</title><body><p>&xxe;</p></body></topic>'
+        )
+        chunks = chunk_dita(xml, "docs/xxe.dita", "dita", default_config)
+        assert chunks == []

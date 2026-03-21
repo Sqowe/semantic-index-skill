@@ -14,7 +14,7 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Optional
 
-from .common import count_tokens, make_chunk_id
+from .common import count_tokens, get_tokenizer, make_chunk_id
 from ..config import Config
 from ..models import Chunk, ChunkType
 
@@ -41,6 +41,10 @@ _BODY_CLASSES = frozenset({
 })
 _SECTION_CLASS = "topic/section"
 _PROLOG_CLASS = "topic/prolog"
+
+# Safety limit: reject XML content larger than 10 MB to mitigate
+# entity-expansion / billion-laughs DoS from untrusted repos.
+_MAX_XML_BYTES = 10 * 1024 * 1024
 
 
 def _strip_ns(tag: str) -> str:
@@ -168,6 +172,7 @@ def _make_chunk(
     line_hint: int = 1,
 ) -> Chunk:
     """Build a Chunk with standard field computation."""
+    meta = {**metadata, "line_approximate": True}
     return Chunk(
         id=make_chunk_id(file_path, text, line_hint),
         file_path=file_path,
@@ -178,7 +183,7 @@ def _make_chunk(
         language=language,
         symbol_name=title or None,
         token_count=count_tokens(text),
-        metadata=metadata,
+        metadata=meta,
     )
 
 
@@ -234,11 +239,35 @@ def _chunk_topic(
     return _split_by_sections(body_elem, title, shortdesc, prefix, file_path, config, meta)
 
 
+def _truncate_text(text: str, max_tokens: int) -> tuple[str, bool]:
+    """Truncate text to fit within max_tokens. Returns (text, was_truncated)."""
+    if count_tokens(text) <= max_tokens:
+        return text, False
+    # Try line-level truncation first
+    lines = text.split("\n")
+    kept: list[str] = []
+    tokens = 0
+    for line in lines:
+        line_tokens = count_tokens(line)
+        if tokens + line_tokens > max_tokens and kept:
+            break
+        kept.append(line)
+        tokens += line_tokens
+    result = "\n".join(kept)
+    # If still over (single long line), hard-truncate by tokens
+    if count_tokens(result) > max_tokens:
+        enc = get_tokenizer()
+        token_ids = enc.encode(result)[:max_tokens]
+        result = enc.decode(token_ids)
+    return result, True
+
+
 def _split_by_sections(
     body: ET.Element, title: str, shortdesc: str, prefix: str,
     file_path: str, config: Config, metadata: dict,
 ) -> list[Chunk]:
     """Split an oversized topic body at <section> boundaries."""
+    max_tokens = config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     ctx = "\n".join(p for p in [prefix, title] if p)
     chunks: list[Chunk] = []
@@ -249,10 +278,13 @@ def _split_by_sections(
         if not parts:
             return
         text = "\n".join([ctx] + parts) if ctx else "\n".join(parts)
-        if count_tokens(text) >= min_tokens:
-            chunks.append(_make_chunk(
-                file_path, text, ChunkType.DITA_TOPIC, "dita", metadata, title,
-            ))
+        if count_tokens(text) < min_tokens:
+            return
+        text, truncated = _truncate_text(text, max_tokens)
+        meta = {**metadata, "truncated": True} if truncated else metadata
+        chunks.append(_make_chunk(
+            file_path, text, ChunkType.DITA_TOPIC, "dita", meta, title,
+        ))
 
     for child in body:
         child_tag = _strip_ns(child.tag)
@@ -270,8 +302,11 @@ def _split_by_sections(
                 continue
             sec_idx += 1
             full = f"{ctx}\n{sec_text}" if ctx else sec_text
+            full, truncated = _truncate_text(full, max_tokens)
             if count_tokens(full) >= min_tokens:
                 sec_meta = {**metadata, "section_index": sec_idx}
+                if truncated:
+                    sec_meta["truncated"] = True
                 chunks.append(_make_chunk(
                     file_path, full, ChunkType.DITA_TOPIC, "dita",
                     sec_meta, title, sec_idx,
@@ -333,10 +368,15 @@ def _chunk_ditamap(
     if count_tokens(full_text) < min_tokens:
         return []
 
+    max_tokens = config.chunking.max_tokens
+    full_text, truncated = _truncate_text(full_text, max_tokens)
+
     lang = _get_lang(root)
     meta: dict = {"topic_type": "map"}
     if lang:
         meta["xml_lang"] = lang
+    if truncated:
+        meta["truncated"] = True
 
     return [_make_chunk(
         file_path, full_text, ChunkType.DITA_MAP, "ditamap", meta, map_title,
@@ -374,6 +414,21 @@ def chunk_dita(
     Returns:
         List of Chunk objects. May be empty if the file has no content.
     """
+    if not content or not content.strip():
+        return []
+    if len(content.encode("utf-8", errors="replace")) > _MAX_XML_BYTES:
+        logger.warning(
+            "DITA file %s exceeds %d byte safety limit, skipping",
+            file_path, _MAX_XML_BYTES,
+        )
+        return []
+    # Reject DTD/entity declarations to prevent entity expansion attacks
+    if "<!DOCTYPE" in content or "<!ENTITY" in content:
+        logger.warning(
+            "DITA file %s contains DTD/entity declarations, skipping for safety",
+            file_path,
+        )
+        return []
     try:
         root = ET.fromstring(content)
     except ET.ParseError as exc:
