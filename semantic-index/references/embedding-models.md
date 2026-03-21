@@ -756,3 +756,77 @@ Use this table to pick a model for the `openrouter` provider.
 **Models NOT on OpenRouter** (local-only via HuggingFace):
 nomic-embed-text-v1.5, nomic-embed-text-v2-moe, SFR-Embedding-Code, Snowflake Arctic,
 Jina v3, mxbai-embed-large-v1, CodeT5+, CodeBERT.
+
+---
+
+## Local Provider Setup (HuggingFace)
+
+Phase 4 added the `huggingface` provider for local embedding inference via
+sentence-transformers. This section covers setup, resource requirements, and
+device selection.
+
+### Installation
+
+```bash
+# Option 1: explicit flag
+bash setup.sh --with-huggingface
+
+# Option 2: auto-detected from config (if provider is "huggingface")
+bash setup.sh
+```
+
+This installs `sentence-transformers>=3.0.0` and `torch>=2.0.0` into the
+skill's virtual environment. First install is ~2-4 GB depending on platform.
+
+### Model Download
+
+On first use, the model is downloaded to `~/.cache/huggingface/hub`. Override
+the cache location with the `HF_HUB_CACHE` environment variable.
+
+| Model | Download Size | Disk Cache | RAM Usage |
+|-------|--------------|------------|-----------|
+| BAAI/bge-m3 (default) | ~1.1 GB | ~1.1 GB | ~1.5-2 GB |
+| nomic-ai/nomic-embed-text-v1.5 | ~274 MB | ~274 MB | ~500 MB |
+| SFR-Embedding-Code-400M | ~800 MB | ~800 MB | ~1.5 GB |
+
+### Device Selection
+
+The `embedding.device` config field controls where inference runs:
+
+| Value | Behavior |
+|-------|----------|
+| `null` (default) | Auto-detect: CUDA > MPS > CPU |
+| `"cpu"` | Force CPU (useful if GPU causes issues) |
+| `"cuda"` | Force NVIDIA GPU (requires CUDA toolkit) |
+| `"mps"` | Force Apple Silicon GPU (macOS only) |
+
+### Performance Estimates
+
+Approximate indexing speed for a 500-file project (~1,650 chunks):
+
+| Device | BGE-M3 (568M) | Nomic v1.5 (137M) |
+|--------|---------------|-------------------|
+| CPU (modern laptop) | ~90-180 sec | ~30-60 sec |
+| Apple M1/M2 (MPS) | ~20-40 sec | ~10-20 sec |
+| NVIDIA GPU (CUDA) | ~5-15 sec | ~3-8 sec |
+
+### Cross-Provider Compatibility
+
+Indexes built with one provider can be searched with the other, as long as
+the model and dimensions match. For example, you can build an index with
+`"provider": "openrouter"` on a CI server and search locally with
+`"provider": "huggingface"` — the vectors are identical.
+
+### Reranking (Cross-Encoder)
+
+Phase 4 also added optional cross-encoder reranking via the `search.rerank_*`
+config fields. The default reranker model is `BAAI/bge-reranker-v2-m3` (~568 MB
+download). Reranking requires the HuggingFace dependencies.
+
+| Config Field | Default | Description |
+|-------------|---------|-------------|
+| `search.rerank_enabled` | `false` | Enable cross-encoder reranking |
+| `search.rerank_model` | `"BAAI/bge-reranker-v2-m3"` | CrossEncoder model ID |
+| `search.rerank_top_n` | `10` | Re-rank top N results |
+
+Enable via config or CLI: `--rerank` flag on `semantic_search.py`.

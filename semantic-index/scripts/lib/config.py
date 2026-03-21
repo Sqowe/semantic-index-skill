@@ -32,6 +32,8 @@ class EmbeddingConfig:
     document_prefix: str = ""
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
+    device: Optional[str] = None  # None=auto, "cpu", "cuda", "mps"
+    trust_remote_code: bool = False  # Allow model repos to run arbitrary code
 
 
 @dataclass
@@ -70,6 +72,11 @@ class SearchConfig:
 
     default_top_k: int = 10
     default_threshold: float = 0.3
+    mode: str = "hybrid"           # "vector", "keyword", or "hybrid"
+    hybrid_alpha: float = 0.7      # 0.0 = pure keyword, 1.0 = pure vector
+    rerank_enabled: bool = False
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_top_n: int = 10         # Re-rank top N results from initial retrieval
 
 
 @dataclass
@@ -128,6 +135,10 @@ def _config_to_dict(config: Config) -> dict:
 
 def _apply_env_overrides(config: Config) -> None:
     """Override config values with environment variables where set."""
+    provider = os.environ.get("SEMANTIC_INDEX_PROVIDER")
+    if provider:
+        config.embedding.provider = provider
+
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if api_key:
         config.embedding.api_key = api_key
@@ -142,6 +153,42 @@ def _apply_env_overrides(config: Config) -> None:
             config.embedding.dimensions = int(dimensions)
         except ValueError:
             logger.warning("Invalid SEMANTIC_INDEX_DIMENSIONS: %s (not an integer)", dimensions)
+
+
+_VALID_SEARCH_MODES = {"vector", "keyword", "hybrid"}
+_VALID_PROVIDERS = {"openrouter", "huggingface"}
+_VALID_DEVICES = {None, "cpu", "cuda", "mps"}
+
+
+def _validate_config(config: Config) -> None:
+    """Validate config values after loading and env overrides.
+
+    Raises:
+        ConfigError: If any value is invalid.
+    """
+    if config.embedding.provider not in _VALID_PROVIDERS:
+        raise ConfigError(
+            f"Invalid embedding.provider: {config.embedding.provider!r}. "
+            f"Must be one of: {', '.join(sorted(_VALID_PROVIDERS))}"
+        )
+
+    if config.embedding.device not in _VALID_DEVICES:
+        raise ConfigError(
+            f"Invalid embedding.device: {config.embedding.device!r}. "
+            f"Must be one of: null, \"cpu\", \"cuda\", \"mps\""
+        )
+
+    if config.search.mode not in _VALID_SEARCH_MODES:
+        raise ConfigError(
+            f"Invalid search.mode: {config.search.mode!r}. "
+            f"Must be one of: {', '.join(sorted(_VALID_SEARCH_MODES))}"
+        )
+
+    if not (0.0 <= config.search.hybrid_alpha <= 1.0):
+        raise ConfigError(
+            f"Invalid search.hybrid_alpha: {config.search.hybrid_alpha}. "
+            "Must be between 0.0 and 1.0 (inclusive)."
+        )
 
 
 def load_config(project_dir: str, config_path: Optional[str] = None) -> Config:
@@ -188,6 +235,7 @@ def load_config(project_dir: str, config_path: Optional[str] = None) -> Config:
         logger.info("No config found at %s, using defaults", cfg_path)
 
     _apply_env_overrides(config)
+    _validate_config(config)
     return config
 
 

@@ -1,7 +1,11 @@
-"""Embedding API client for OpenRouter.
+"""Embedding provider abstraction, factory, and caching layer.
 
-Handles batching, retry with exponential backoff, and local caching
-of embeddings by content hash to minimize API costs on re-indexing.
+Defines the EmbeddingProvider ABC, a factory function to instantiate
+the correct provider based on config, and the EmbeddingCache for
+on-disk caching of content-hash → vector mappings.
+
+The Embedder class wraps a provider with caching and batch orchestration,
+providing the same public API used by build_index.py and semantic_search.py.
 """
 
 import hashlib
@@ -9,19 +13,103 @@ import json
 import logging
 import sys
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
-
-import requests
 
 from .config import Config, INDEX_DIR_NAME
 from .models import Chunk, EmbeddingError
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 CACHE_FILENAME = "embedding_cache.json"
 
+
+# ---------------------------------------------------------------------------
+# Abstract provider interface
+# ---------------------------------------------------------------------------
+
+class EmbeddingProvider(ABC):
+    """Base class for all embedding providers."""
+
+    @abstractmethod
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of document texts. Returns list of vectors.
+
+        Provider handles prefixing (e.g., 'search_document:' for Nomic).
+        """
+
+    @abstractmethod
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a single search query. Returns one vector.
+
+        Provider handles prefixing (e.g., 'search_query:' for Nomic).
+        """
+
+    @abstractmethod
+    def get_dimensions(self) -> int:
+        """Return the dimensionality of the embedding vectors."""
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """Return the model identifier string."""
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+def create_provider(config: Config) -> EmbeddingProvider:
+    """Factory: instantiate the right provider based on config.embedding.provider.
+
+    Supported providers:
+        - "openrouter": REST API via OpenRouter (requires API key)
+        - "huggingface": Local inference via sentence-transformers (no API key)
+
+    Provider imports are lazy — only the selected provider's dependencies
+    are imported. This means sentence-transformers/torch are never imported
+    if the user uses OpenRouter, and requests is never imported if the user
+    uses HuggingFace.
+
+    Args:
+        config: Validated Config object.
+
+    Returns:
+        An EmbeddingProvider instance.
+
+    Raises:
+        EmbeddingError: If the provider is unknown or fails to initialize.
+    """
+    provider = config.embedding.provider
+
+    if provider == "openrouter":
+        from .providers.openrouter import OpenRouterProvider
+        return OpenRouterProvider(config)
+    elif provider == "huggingface":
+        from .providers.huggingface import HuggingFaceProvider
+        return HuggingFaceProvider(config)
+    else:
+        raise EmbeddingError(
+            f"Unknown embedding provider: {provider!r}. "
+            "Supported: 'openrouter', 'huggingface'"
+        )
+
+
+def create_embedder(config: Config) -> EmbeddingProvider:
+    """Deprecated: use create_provider() instead."""
+    import warnings
+    warnings.warn(
+        "create_embedder() is deprecated, use create_provider()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return create_provider(config)
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache
+# ---------------------------------------------------------------------------
 
 class EmbeddingCache:
     """On-disk cache mapping content hashes to embedding vectors.
@@ -83,98 +171,42 @@ class EmbeddingCache:
         self._dirty = False
 
 
+# ---------------------------------------------------------------------------
+# Content hashing
+# ---------------------------------------------------------------------------
+
 def _content_hash(text: str) -> str:
     """SHA-256 hash of text content for cache keying."""
     return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
 
 
+# ---------------------------------------------------------------------------
+# Embedder wrapper (caching + batch orchestration)
+# ---------------------------------------------------------------------------
+
 class Embedder:
-    """OpenRouter embedding API client with batching, retry, and caching."""
+    """High-level embedding client with caching and batch orchestration.
+
+    Wraps an EmbeddingProvider (created via factory) with the embedding
+    cache and batch progress reporting. This is the class used by
+    build_index.py and semantic_search.py.
+
+    Args:
+        config: Validated Config object.
+        project_dir: Optional project directory for cache persistence.
+            If None, caching is disabled.
+    """
 
     def __init__(self, config: Config, project_dir: Optional[str] = None) -> None:
         self._config = config
-        self._api_key = config.embedding.api_key
-        self._model = config.embedding.model
-        self._dimensions = config.embedding.dimensions
-        self._batch_size = config.embedding.batch_size
-        self._doc_prefix = config.embedding.document_prefix
-        self._query_prefix = config.embedding.query_prefix
-        self._max_retries = config.embedding.max_retries
-        self._retry_delay = config.embedding.retry_delay_seconds
+        self._provider = create_provider(config)
         self._cache: Optional[EmbeddingCache] = None
 
         if project_dir:
             self._cache = EmbeddingCache(project_dir, config)
 
-        if not self._api_key:
-            raise EmbeddingError(
-                "No API key found. Set OPENROUTER_API_KEY environment variable "
-                "or add api_key to .index/config.json"
-            )
-
-    def _call_api(self, texts: list[str]) -> list[list[float]]:
-        """Call OpenRouter embeddings API with retry logic.
-
-        Args:
-            texts: List of texts to embed (already prefixed).
-
-        Returns:
-            List of embedding vectors in the same order as input.
-
-        Raises:
-            EmbeddingError: If all retries are exhausted.
-        """
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        body = {
-            "model": self._model,
-            "input": texts,
-        }
-        if self._dimensions:
-            body["dimensions"] = self._dimensions
-
-        last_error: Optional[Exception] = None
-
-        for attempt in range(self._max_retries):
-            try:
-                resp = requests.post(
-                    OPENROUTER_EMBEDDINGS_URL,
-                    headers=headers,
-                    json=body,
-                    timeout=60,
-                )
-
-                # Handle rate limiting
-                if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", self._retry_delay * (2 ** attempt)))
-                    logger.warning("Rate limited, retrying in %.1fs", retry_after)
-                    time.sleep(retry_after)
-                    continue
-
-                resp.raise_for_status()
-                data = resp.json()
-
-                # Sort by index to ensure correct ordering
-                embeddings = sorted(data["data"], key=lambda x: x["index"])
-                return [item["embedding"] for item in embeddings]
-
-            except requests.RequestException as exc:
-                last_error = exc
-                if attempt < self._max_retries - 1:
-                    delay = self._retry_delay * (2 ** attempt)
-                    logger.warning(
-                        "API call failed (attempt %d/%d), retrying in %.1fs: %s",
-                        attempt + 1, self._max_retries, delay, exc,
-                    )
-                    time.sleep(delay)
-
-        raise EmbeddingError(f"Embedding API failed after {self._max_retries} retries: {last_error}")
-
-
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts with document prefix.
+        """Embed a batch of texts via the underlying provider.
 
         Args:
             texts: Raw text strings to embed.
@@ -182,11 +214,10 @@ class Embedder:
         Returns:
             List of embedding vectors.
         """
-        prefixed = [self._doc_prefix + t for t in texts]
-        return self._call_api(prefixed)
+        return self._provider.embed_texts(texts)
 
     def embed_query(self, query: str) -> list[float]:
-        """Embed a single search query with query prefix.
+        """Embed a single search query via the underlying provider.
 
         Args:
             query: Natural language search query.
@@ -194,22 +225,21 @@ class Embedder:
         Returns:
             Single embedding vector.
         """
-        prefixed = self._query_prefix + query
-        vectors = self._call_api([prefixed])
-        return vectors[0]
+        return self._provider.embed_query(query)
 
     def embed_chunks(self, chunks: list[Chunk]) -> int:
         """Embed a list of chunks, using cache where possible.
 
         Modifies chunks in-place by adding a 'vector' key to metadata.
-        Returns the number of API calls made.
+        Returns the number of API/inference calls made.
 
         Args:
             chunks: List of Chunk objects to embed.
 
         Returns:
-            Number of API batch calls made.
+            Number of batch embedding calls made.
         """
+        batch_size = self._config.embedding.batch_size
         api_calls = 0
 
         # Separate cached vs uncached
@@ -228,18 +258,18 @@ class Embedder:
             )
 
         # Batch embed uncached chunks
-        for batch_start in range(0, len(uncached), self._batch_size):
-            batch = uncached[batch_start:batch_start + self._batch_size]
+        for batch_start in range(0, len(uncached), batch_size):
+            batch = uncached[batch_start:batch_start + batch_size]
             texts = [chunk.content for _, chunk in batch]
 
             print(
-                f"  Embedding batch {batch_start // self._batch_size + 1}"
-                f"/{(len(uncached) + self._batch_size - 1) // self._batch_size}"
+                f"  Embedding batch {batch_start // batch_size + 1}"
+                f"/{(len(uncached) + batch_size - 1) // batch_size}"
                 f" ({len(texts)} chunks)...",
                 file=sys.stderr,
             )
 
-            vectors = self.embed_texts(texts)
+            vectors = self._provider.embed_texts(texts)
             api_calls += 1
 
             for (idx, chunk), vector in zip(batch, vectors):

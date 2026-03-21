@@ -8,9 +8,10 @@ Instead of grep/glob for exact string matches, this skill lets you search code b
 
 1. Scans your project for supported files (code + markdown)
 2. Chunks files using AST-aware splitting (Tree-sitter for code, header-based for markdown)
-3. Embeds chunks via the configured provider (BGE-M3 on OpenRouter by default)
-4. Stores embeddings locally in `.index/` (LanceDB format)
-5. Searches by cosine similarity against your natural language queries
+3. Embeds chunks via the configured provider (OpenRouter API or local HuggingFace)
+4. Stores embeddings locally in `.index/` (LanceDB vectors + BM25 keyword index)
+5. Searches using hybrid retrieval (vector similarity + BM25 keyword matching, merged via Reciprocal Rank Fusion)
+6. Optionally re-ranks results with a cross-encoder for higher accuracy
 
 The `.index/` directory is local, gitignoreable, and fully rebuildable. No servers, no Docker, no infrastructure.
 
@@ -18,7 +19,8 @@ The `.index/` directory is local, gitignoreable, and fully rebuildable. No serve
 
 - Python 3.10+
 - Git
-- An [OpenRouter](https://openrouter.ai/) API key (for the default embedding provider)
+- An [OpenRouter](https://openrouter.ai/) API key (for the default embedding provider), OR
+- The HuggingFace optional dependencies for free local embedding (see [Local Embedding](#local-embedding-huggingface-provider))
 
 ## Getting the Skill
 
@@ -103,6 +105,7 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | `embedding.model` | `"BAAI/bge-m3"` | Embedding model |
 | `embedding.dimensions` | `1024` | Vector dimensionality |
 | `embedding.batch_size` | `50` | Texts per API call |
+| `embedding.device` | `null` | Device for local inference: `null` (auto), `"cpu"`, `"cuda"`, `"mps"` |
 | `chunking.max_tokens` | `512` | Max chunk size in tokens |
 | `chunking.overlap_tokens` | `50` | Overlap between adjacent chunks |
 | `chunking.min_tokens` | `20` | Minimum chunk size (smaller chunks are discarded) |
@@ -111,6 +114,11 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | `indexing.max_file_size_kb` | `500` | Skip files larger than this |
 | `search.default_top_k` | `10` | Default number of search results |
 | `search.default_threshold` | `0.3` | Minimum similarity score (0.0–1.0) |
+| `search.mode` | `"hybrid"` | Search mode: `"vector"`, `"keyword"`, or `"hybrid"` |
+| `search.hybrid_alpha` | `0.7` | Balance: 0.0 = pure keyword, 1.0 = pure vector |
+| `search.rerank_enabled` | `false` | Enable cross-encoder reranking (requires HuggingFace deps) |
+| `search.rerank_model` | `"BAAI/bge-reranker-v2-m3"` | Cross-encoder model for reranking |
+| `search.rerank_top_n` | `10` | Number of results to re-rank |
 
 ### Environment Variable Overrides
 
@@ -119,6 +127,7 @@ Environment variables take precedence over config file values:
 | Variable | Overrides |
 |----------|-----------|
 | `OPENROUTER_API_KEY` | `embedding.api_key` |
+| `SEMANTIC_INDEX_PROVIDER` | `embedding.provider` |
 | `SEMANTIC_INDEX_MODEL` | `embedding.model` |
 | `SEMANTIC_INDEX_DIMENSIONS` | `embedding.dimensions` |
 
@@ -131,6 +140,71 @@ tests/fixtures/
 **/generated/
 data/large-dataset.json
 ```
+
+### Local Embedding (HuggingFace Provider)
+
+Instead of calling the OpenRouter API, you can run embeddings locally using sentence-transformers. This is free, works offline, and keeps all data on your machine.
+
+**Install HuggingFace dependencies:**
+
+```bash
+cd ~/.kiro/skills/semantic-index/scripts
+bash setup.sh --with-huggingface
+```
+
+This installs `sentence-transformers` and `torch` (~2-4 GB) into the skill's venv. The embedding model (~1.1 GB for BGE-M3) is downloaded on first use to `~/.cache/huggingface/hub`.
+
+**Switch to local provider** in `.index/config.json`:
+
+```json
+{
+  "embedding": {
+    "provider": "huggingface",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "device": null
+  }
+}
+```
+
+Or via environment variable:
+
+```bash
+export SEMANTIC_INDEX_PROVIDER=huggingface
+```
+
+The `device` field controls where inference runs: `null` (auto-detect: CUDA > MPS > CPU), `"cpu"`, `"cuda"`, or `"mps"`.
+
+**Cross-provider compatibility:** Indexes built with OpenRouter can be searched with HuggingFace and vice versa, as long as the model and dimensions match. The vectors are identical.
+
+### Reranking (Cross-Encoder)
+
+For higher-quality search results, enable cross-encoder reranking. After the initial retrieval (vector/keyword/hybrid), a cross-encoder model re-scores each result against the query for more accurate relevance ranking.
+
+Reranking requires the HuggingFace dependencies (`bash setup.sh --with-huggingface`).
+
+**Enable via config** (`.index/config.json`):
+
+```json
+{
+  "search": {
+    "rerank_enabled": true,
+    "rerank_model": "BAAI/bge-reranker-v2-m3",
+    "rerank_top_n": 10
+  }
+}
+```
+
+**Or via CLI flag:**
+
+```bash
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
+  --project-dir $PROJECT \
+  --query "authentication flow" \
+  --rerank
+```
+
+Use `--no-rerank` to disable reranking for a single query even when enabled in config.
 
 ## Usage
 
@@ -220,12 +294,32 @@ $SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
   --project-dir $PROJECT \
   --query "API route definitions" \
   --filter-path "src/**"
+
+# Search modes: vector-only, keyword-only, or hybrid (default)
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
+  --project-dir $PROJECT \
+  --query "database connection" \
+  --mode keyword
+
+# Hybrid search with custom alpha (0.0 = pure keyword, 1.0 = pure vector)
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
+  --project-dir $PROJECT \
+  --query "error handling" \
+  --mode hybrid \
+  --alpha 0.5
+
+# Re-rank results with a cross-encoder for higher accuracy
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/semantic_search.py \
+  --project-dir $PROJECT \
+  --query "payment processing flow" \
+  --rerank
 ```
 
 Output:
 ```json
 {
   "query": "how does authentication work?",
+  "mode": "hybrid",
   "results": [
     {
       "rank": 1,
@@ -380,10 +474,12 @@ semantic-index/
 │   └── embedding-models.md     # Model comparison guide
 └── scripts/
     ├── setup.sh                # One-command environment setup
-    ├── requirements.txt        # Python dependencies
+    ├── requirements.txt        # Core Python dependencies
+    ├── requirements-huggingface.txt  # Optional: local embedding deps
     ├── build_index.py          # CLI: build/rebuild the index
     ├── semantic_search.py      # CLI: search by meaning
     ├── index_status.py         # CLI: index health check
+    ├── migrate_config.py       # CLI: migrate config to latest schema
     └── lib/
         ├── __init__.py
         ├── models.py           # Data classes and exceptions
@@ -395,8 +491,15 @@ semantic-index/
         │   ├── common.py       # Shared chunking utilities
         │   ├── code.py         # Tree-sitter AST-aware code chunking
         │   └── markdown.py     # Header-based markdown chunking
-        ├── embedder.py         # OpenRouter embedding client + cache
-        └── store.py            # LanceDB vector store wrapper
+        ├── embedder.py         # EmbeddingProvider ABC, factory, cache
+        ├── providers/
+        │   ├── __init__.py     # Provider registry
+        │   ├── openrouter.py   # OpenRouter REST API provider
+        │   └── huggingface.py  # Local sentence-transformers provider
+        ├── reranker.py         # Cross-encoder reranker
+        ├── store.py            # LanceDB vector store wrapper
+        ├── bm25.py             # BM25 keyword index
+        └── fusion.py           # Reciprocal Rank Fusion (RRF)
 ```
 
 ## Troubleshooting

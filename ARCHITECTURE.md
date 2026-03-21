@@ -1176,32 +1176,36 @@ pathspec>=0.12.0
 
 **Goal**: Better search results through hybrid search and re-ranking.
 
-| Step | Task |
-|------|------|
-| 3.1 | Add BM25 keyword index alongside vector store |
-| 3.2 | Implement Reciprocal Rank Fusion (RRF) to merge BM25 + vector results |
-| 3.3 | Add optional re-ranking step (cross-encoder model via OpenRouter) |
-| 3.4 | Tunable weights: user can adjust semantic vs. keyword balance |
+| Step | Task | Status |
+|------|------|--------|
+| 3.1 | Add BM25 keyword index alongside vector store | ✅ Done |
+| 3.2 | Implement Reciprocal Rank Fusion (RRF) to merge BM25 + vector results | ✅ Done |
+| 3.3 | ~~Add optional re-ranking step (cross-encoder model via OpenRouter)~~ | ⏩ Moved to Phase 4 (requires local sentence-transformers, no reranking models on OpenRouter) |
+| 3.4 | Tunable weights: user can adjust semantic vs. keyword balance | ✅ Done |
 
 ### Phase 4: HuggingFace Local Embedding Provider
 
 **Goal**: Add local embedding via sentence-transformers as an alternative to
 OpenRouter, enabling zero-cost, offline, low-latency indexing and search.
 
-| Step | Task | Details |
-|------|------|---------|
-| 4.1 | Create `lib/providers/` package | `__init__.py` with provider registry |
-| 4.2 | Extract `OpenRouterProvider` from existing `embedder.py` | Move current OpenRouter logic to `providers/openrouter.py`, keep same behavior |
-| 4.3 | Define `EmbeddingProvider` ABC in `embedder.py` | `embed_texts()`, `embed_query()`, `get_dimensions()`, `model_name` property |
-| 4.4 | Create `create_embedder()` factory in `embedder.py` | Reads `config.embedding.provider`, lazy-imports the right provider |
-| 4.5 | Implement `HuggingFaceProvider` in `providers/huggingface.py` | sentence-transformers `SentenceTransformer.encode()`, auto device detection |
-| 4.6 | Create `requirements-huggingface.txt` | `sentence-transformers>=3.0.0`, `torch>=2.0.0` |
-| 4.7 | Update `setup.sh` to handle optional deps | Add `--with-huggingface` flag and auto-detect provider from existing `.index/config.json`. Current `setup.sh` only installs core deps — it has no HuggingFace awareness. |
-| 4.8 | Add `SEMANTIC_INDEX_PROVIDER` env var override in `config.py` | Currently not implemented. Add to `_apply_env_overrides()` so env var overrides `config.embedding.provider`. |
-| 4.9 | Update `build_index.py` and `semantic_search.py` | Replace `Embedder(config)` with `create_embedder(config)` |
-| 4.10 | Add `device` field to config schema and `Config` class | `null` (auto), `"cpu"`, `"cuda"`, `"mps"` |
-| 4.11 | Test: same model produces identical vectors via both providers | Index with OpenRouter, search with HuggingFace (and vice versa) |
-| 4.12 | Update `references/embedding-models.md` | Add local model recommendations, RAM requirements, download sizes |
+| Step | Task | Details | Status |
+|------|------|---------|--------|
+| 4.1 | Create `lib/providers/` package | `__init__.py` with provider registry | ✅ Done |
+| 4.2 | Extract `OpenRouterProvider` from existing `embedder.py` | Move current OpenRouter logic to `providers/openrouter.py`, keep same behavior | ✅ Done |
+| 4.3 | Define `EmbeddingProvider` ABC in `embedder.py` | `embed_texts()`, `embed_query()`, `get_dimensions()`, `model_name` property | ✅ Done |
+| 4.4 | Create `create_embedder()` factory in `embedder.py` | Reads `config.embedding.provider`, lazy-imports the right provider | ✅ Done |
+| 4.5 | Implement `HuggingFaceProvider` in `providers/huggingface.py` | sentence-transformers `SentenceTransformer.encode()`, auto device detection | ✅ Done |
+| 4.6 | Create `requirements-huggingface.txt` | `sentence-transformers>=3.0.0`, `torch>=2.0.0` | ✅ Done |
+| 4.7 | Update `setup.sh` to handle optional deps | Add `--with-huggingface` flag and auto-detect provider from existing `.index/config.json`. Current `setup.sh` only installs core deps — it has no HuggingFace awareness. | ✅ Done |
+| 4.8 | Add `SEMANTIC_INDEX_PROVIDER` env var override in `config.py` | Currently not implemented. Add to `_apply_env_overrides()` so env var overrides `config.embedding.provider`. | ✅ Done |
+| 4.9 | Update `build_index.py` and `semantic_search.py` | Replace `Embedder(config)` with `create_embedder(config)` | ✅ Done |
+| 4.10 | Add `device` field to config schema and `Config` class | `null` (auto), `"cpu"`, `"cuda"`, `"mps"` | ✅ Done |
+| 4.11 | Test: same model produces identical vectors via both providers | Index with OpenRouter, search with HuggingFace (and vice versa) | ⬜ Manual verification |
+| 4.12 | Update `references/embedding-models.md` | Add local model recommendations, RAM requirements, download sizes | ✅ Done |
+| 4.13 | Implement `Reranker` class in `lib/reranker.py` | Uses `sentence_transformers.CrossEncoder` with `BAAI/bge-reranker-v2-m3` for local cross-encoder re-ranking. Lazy import, same optional dep as HuggingFace embedder. | ✅ Done |
+| 4.14 | Add rerank config fields to `SearchConfig` | `rerank_enabled: false`, `rerank_model: str`, `rerank_top_n: int`. Only activates when HuggingFace deps are installed. | ✅ Done |
+| 4.15 | Integrate reranker into `semantic_search.py` | After RRF fusion, optionally re-rank top-N results via cross-encoder. Add `--rerank` CLI flag. | ✅ Done |
+| 4.16 | Update `migrate_config.py` to handle rerank fields | Add rerank fields during config migration when upgrading from Phase 3 to Phase 4. | ✅ Done |
 
 **Dependencies (requirements-huggingface.txt):**
 ```
@@ -1298,6 +1302,139 @@ well-suited for semantic chunking — each topic covers a single subject by desi
 | 7.1 | Wrap `build_index.py` / `semantic_search.py` / `index_status.py` as MCP tools |
 | 7.2 | Add FastMCP server entry point |
 | 7.3 | Keep the SKILL as the primary interface; MCP is an alternative transport |
+
+### Phase 8: Parallel Indexing Pipeline
+
+**Goal**: Reduce indexing time on large projects by parallelizing the CPU-bound
+stages of the pipeline (chunking, hashing), especially when using the local
+HuggingFace provider where embedding is fast on GPU and chunking becomes the
+bottleneck.
+
+#### Current Bottleneck Analysis
+
+The indexing pipeline has three sequential stages per file batch:
+
+```
+1. Chunking (CPU-bound)     — Tree-sitter parsing, tokenization, chunk splitting
+2. Embedding (CPU or GPU)   — sentence-transformers encode() / OpenRouter API
+3. Store commit (I/O-bound) — LanceDB write, BM25 index update
+```
+
+| Stage | OpenRouter provider | HuggingFace CPU | HuggingFace GPU |
+|-------|-------------------|-----------------|-----------------|
+| Chunking | ~5% of time | ~20-30% of time | ~60-80% of time |
+| Embedding | ~90% of time (network) | ~60-70% of time | ~10-20% of time |
+| Store commit | ~5% of time | ~5-10% of time | ~10-20% of time |
+
+With OpenRouter, the network round-trip dominates — parallelizing chunking
+saves little. With HuggingFace on GPU, chunking is the clear bottleneck
+because PyTorch already saturates the GPU during `encode()`.
+
+#### Option A: Parallel Chunking with ProcessPoolExecutor
+
+Parallelize the chunking stage using `concurrent.futures.ProcessPoolExecutor`.
+Tree-sitter parsing is C-level code that releases the GIL, but the Python
+wrapper and tokenization (tiktoken) hold it, so multiprocessing is safer than
+threading for true parallelism.
+
+```
+Files ──→ [ProcessPool: chunk_file()] ──→ Chunks ──→ embed ──→ store
+           worker 1: file_a.py
+           worker 2: file_b.ts
+           worker 3: file_c.go
+           worker N: ...
+```
+
+| Pros | Cons |
+|------|------|
+| True parallelism (bypasses GIL) | Process startup overhead (~100-200ms per worker) |
+| Linear speedup for chunking stage | IPC serialization cost for Chunk objects |
+| No shared state concerns | Each worker loads its own Tree-sitter grammars (~50MB RSS per worker) |
+| Simple to implement (~50 lines) | Memory multiplied by worker count |
+
+**Estimated speedup**: 2-4x on chunking stage (diminishing returns past 4 workers
+due to IPC overhead). On a GPU setup where chunking is 70% of time, this translates
+to ~1.5-2.5x overall speedup.
+
+**Memory impact**: Each worker process loads Tree-sitter grammars independently.
+With 4 workers on a 500-file project: ~200MB additional RSS. Acceptable on modern
+machines, but worth capping `max_workers` at `min(cpu_count, 4)`.
+
+#### Option B: Pipeline Parallelism (Chunking ∥ Embedding)
+
+Overlap chunking and embedding using a producer-consumer pattern. While batch N
+is being embedded, batch N+1 is being chunked.
+
+```
+Time →
+Chunk batch 1 ──→ Chunk batch 2 ──→ Chunk batch 3 ──→
+                  Embed batch 1 ──→ Embed batch 2 ──→ Embed batch 3
+                                    Store batch 1 ──→ Store batch 2
+```
+
+Implementation: two threads with a `queue.Queue` between them. The chunking
+thread produces batches, the embedding thread consumes them.
+
+| Pros | Cons |
+|------|------|
+| Hides chunking latency behind embedding latency | Only helps when both stages are significant |
+| Low memory overhead (one extra batch in flight) | More complex error handling (thread coordination) |
+| Works with both providers | Limited speedup: max 2x (two stages overlapped) |
+| No IPC serialization cost | Embedding thread holds GIL during Python glue code |
+
+**Estimated speedup**: ~1.3-1.5x overall. The overlap is imperfect because
+both stages have Python-level work that contends for the GIL. Most effective
+when chunking and embedding take roughly equal time (HuggingFace on CPU).
+
+#### Option C: Combined (Parallel Chunking + Pipeline)
+
+Use ProcessPoolExecutor for chunking AND overlap with embedding via a queue.
+This is the maximum-throughput option.
+
+```
+                    ┌─ worker 1 ─┐
+Files ──→ ProcessPool─ worker 2 ─├──→ Queue ──→ Embed thread ──→ Store
+                    └─ worker N ─┘
+```
+
+| Pros | Cons |
+|------|------|
+| Maximum throughput | Most complex implementation (~150 lines) |
+| Addresses both bottlenecks | Hardest to debug and test |
+| Best for large repos on GPU | Overkill for small projects or OpenRouter |
+
+**Estimated speedup**: ~2-3x overall on GPU setups with large repos (1000+ files).
+
+#### Recommendation
+
+**Start with Option A** (parallel chunking). It's the simplest, gives the biggest
+bang-for-buck on GPU setups, and doesn't complicate the embedding/store pipeline.
+Option B can be layered on later if profiling shows embedding latency is still
+significant after chunking is parallelized.
+
+#### Implementation Steps
+
+| Step | Task | Details |
+|------|------|---------|
+| 8.1 | Add `indexing.parallel_workers` config field | Default `null` (auto = `min(cpu_count, 4)`), `1` to disable. Add to `IndexingConfig`, `default-config.json`, `migrate_config.py`. |
+| 8.2 | Create `lib/parallel.py` | `parallel_chunk_files(file_paths, project_dir, config) -> list[Chunk]` using `ProcessPoolExecutor`. Handles worker errors gracefully (log + skip file). |
+| 8.3 | Update `build_index.py` to use parallel chunking | Replace sequential `for file_path in file_batch: chunk_file(...)` with `parallel_chunk_files()` when `parallel_workers > 1`. Fall back to sequential on error. |
+| 8.4 | Add `--workers N` CLI flag to `build_index.py` | Override `indexing.parallel_workers` from command line. `--workers 1` forces sequential. |
+| 8.5 | Benchmark: sequential vs parallel on 500-file and 2000-file projects | Measure wall time, peak RSS, and CPU utilization. Document results. |
+| 8.6 | (Optional) Pipeline parallelism — Option B | Producer-consumer queue between chunking and embedding. Only if benchmarks show embedding is still a bottleneck after 8.2. |
+
+#### Notes
+
+- **OpenRouter provider**: Parallel chunking still helps slightly (chunking
+  happens while waiting for the previous batch's API response to return), but
+  the network round-trip dominates. Don't expect dramatic improvements.
+- **Thread safety**: `VectorStore`, `BM25Index`, and `EmbeddingCache` are NOT
+  thread-safe. All store/cache operations must remain on the main thread.
+  Only chunking moves to worker processes.
+- **sentence-transformers internal parallelism**: PyTorch already uses
+  `OMP_NUM_THREADS` for CPU inference and CUDA streams for GPU. Adding
+  Python-level parallelism to the embedding step would likely cause contention,
+  not speedup. Leave embedding single-threaded.
 
 ---
 
