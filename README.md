@@ -351,10 +351,22 @@ On error, JSON is still written to stdout:
 
 ## Supported Languages
 
-AST-aware chunking (Tree-sitter) is available for:
-- Python, JavaScript, TypeScript
+AST-aware chunking via Tree-sitter is available for 10 languages:
 
-All other text files matching configured extensions fall back to blank-line splitting.
+| Language | Extensions | Key constructs extracted |
+|----------|-----------|------------------------|
+| Python | `.py` | functions, classes, methods |
+| JavaScript | `.js`, `.jsx` | functions, classes, arrow functions |
+| TypeScript | `.ts`, `.tsx` | functions, classes, interfaces |
+| Go | `.go` | functions, types, method declarations |
+| Rust | `.rs` | functions, structs, impl blocks |
+| Java | `.java` | classes, methods, interfaces |
+| C | `.c`, `.h` | functions, structs, typedefs |
+| C++ | `.cpp`, `.hpp` | functions, classes, namespaces |
+| Ruby | `.rb` | modules, classes, methods |
+| PHP | `.php` | classes, functions, methods |
+
+Markdown files (`.md`, `.mdx`) use header-based chunking. All other text files matching configured extensions fall back to blank-line splitting.
 
 ## Project Structure
 
@@ -363,6 +375,9 @@ semantic-index/
 ├── SKILL.md                    # AI-facing instructions
 ├── assets/
 │   └── default-config.json     # Default configuration template
+├── references/
+│   ├── supported-languages.md  # Tree-sitter grammar list & extensions
+│   └── embedding-models.md     # Model comparison guide
 └── scripts/
     ├── setup.sh                # One-command environment setup
     ├── requirements.txt        # Python dependencies
@@ -374,7 +389,12 @@ semantic-index/
         ├── models.py           # Data classes and exceptions
         ├── config.py           # Configuration loader
         ├── hasher.py           # File change detection (SHA-256)
-        ├── chunker.py          # AST-aware code + markdown chunking
+        ├── chunker.py          # Chunking dispatch + fallback
+        ├── chunkers/
+        │   ├── __init__.py
+        │   ├── common.py       # Shared chunking utilities
+        │   ├── code.py         # Tree-sitter AST-aware code chunking
+        │   └── markdown.py     # Header-based markdown chunking
         ├── embedder.py         # OpenRouter embedding client + cache
         └── store.py            # LanceDB vector store wrapper
 ```
