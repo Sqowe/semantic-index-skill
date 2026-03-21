@@ -1165,12 +1165,12 @@ pathspec>=0.12.0
 
 **Goal**: Add Tree-sitter grammars for Go, Rust, Java, C/C++, Ruby, PHP.
 
-| Step | Task |
-|------|------|
-| 2.1 | Add tree-sitter grammars to requirements |
-| 2.2 | Implement language-specific AST node queries for each language |
-| 2.3 | Test chunking quality across languages |
-| 2.4 | Update `references/supported-languages.md` |
+| Step | Task | Status |
+|------|------|--------|
+| 2.1 | Add tree-sitter grammars to requirements | ✅ Done |
+| 2.2 | Implement language-specific AST node queries for each language | ✅ Done |
+| 2.3 | Test chunking quality across languages | ✅ Done |
+| 2.4 | Update `references/supported-languages.md` | ✅ Done |
 
 ### Phase 3: Search Quality Improvements
 

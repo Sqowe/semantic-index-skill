@@ -5,7 +5,8 @@ functions, classes, and methods as individual chunks. Module-level
 code (imports, constants) becomes a separate chunk. Oversized nodes
 are split at logical boundaries.
 
-Supported languages (Phase 1): Python, JavaScript, TypeScript.
+Supported languages: Python, JavaScript, TypeScript, Go, Rust, Java,
+C, C++, Ruby, PHP.
 """
 
 import logging
@@ -43,6 +44,59 @@ EXTRACTABLE_NODES: dict[str, list[str]] = {
         "interface_declaration",
         "type_alias_declaration",
     ],
+    "go": [
+        "function_declaration",
+        "method_declaration",
+        "type_declaration",
+    ],
+    "rust": [
+        "function_item",
+        "struct_item",
+        "enum_item",
+        "impl_item",
+        "trait_item",
+        "type_item",
+        "const_item",
+        "static_item",
+        "macro_definition",
+    ],
+    "java": [
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
+        "annotation_type_declaration",
+    ],
+    "c": [
+        "function_definition",
+        "struct_specifier",
+        "enum_specifier",
+        "type_definition",
+        "declaration",
+    ],
+    "cpp": [
+        "function_definition",
+        "class_specifier",
+        "struct_specifier",
+        "enum_specifier",
+        "namespace_definition",
+        "template_declaration",
+        "type_definition",
+        "declaration",
+    ],
+    "ruby": [
+        "method",
+        "class",
+        "module",
+        "singleton_method",
+    ],
+    "php": [
+        "function_definition",
+        "class_declaration",
+        "interface_declaration",
+        "trait_declaration",
+        "enum_declaration",
+    ],
 }
 
 # Node types that represent methods inside classes
@@ -50,6 +104,13 @@ METHOD_NODES: dict[str, list[str]] = {
     "python": ["function_definition"],
     "javascript": ["method_definition"],
     "typescript": ["method_definition", "public_field_definition"],
+    "go": [],  # Go methods are top-level (method_declaration), not nested
+    "rust": ["function_item"],  # Inside impl blocks
+    "java": ["method_declaration", "constructor_declaration"],
+    "c": [],  # C has no classes
+    "cpp": ["function_definition"],
+    "ruby": ["method", "singleton_method"],
+    "php": ["method_declaration"],
 }
 
 
@@ -92,6 +153,91 @@ def _get_ts_language(language: str):
             return None
         except Exception as exc:
             logger.warning("Failed to load TypeScript grammar: %s", exc)
+            return None
+
+    elif language == "go":
+        try:
+            import tree_sitter_go
+            return tree_sitter_go.language()
+        except ImportError:
+            logger.warning("tree-sitter-go not installed, falling back to text splitting for Go")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load Go grammar: %s", exc)
+            return None
+
+    elif language == "rust":
+        try:
+            import tree_sitter_rust
+            return tree_sitter_rust.language()
+        except ImportError:
+            logger.warning("tree-sitter-rust not installed, falling back to text splitting for Rust")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load Rust grammar: %s", exc)
+            return None
+
+    elif language == "java":
+        try:
+            import tree_sitter_java
+            return tree_sitter_java.language()
+        except ImportError:
+            logger.warning("tree-sitter-java not installed, falling back to text splitting for Java")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load Java grammar: %s", exc)
+            return None
+
+    elif language == "c":
+        try:
+            import tree_sitter_c
+            return tree_sitter_c.language()
+        except ImportError:
+            logger.warning("tree-sitter-c not installed, falling back to text splitting for C")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load C grammar: %s", exc)
+            return None
+
+    elif language == "cpp":
+        try:
+            import tree_sitter_cpp
+            return tree_sitter_cpp.language()
+        except ImportError:
+            logger.warning("tree-sitter-cpp not installed, falling back to text splitting for C++")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load C++ grammar: %s", exc)
+            return None
+
+    elif language == "ruby":
+        try:
+            import tree_sitter_ruby
+            return tree_sitter_ruby.language()
+        except ImportError:
+            logger.warning("tree-sitter-ruby not installed, falling back to text splitting for Ruby")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to load Ruby grammar: %s", exc)
+            return None
+
+    elif language == "php":
+        try:
+            import tree_sitter_php
+            return tree_sitter_php.language_php()
+        except (ImportError, AttributeError):
+            try:
+                # Some versions expose language() instead of language_php()
+                import tree_sitter_php
+                return tree_sitter_php.language()
+            except ImportError:
+                logger.warning("tree-sitter-php not installed, falling back to text splitting for PHP")
+                return None
+            except Exception as exc:
+                logger.warning("Failed to load PHP grammar: %s", exc)
+                return None
+        except Exception as exc:
+            logger.warning("Failed to load PHP grammar: %s", exc)
             return None
 
     return None
@@ -170,9 +316,67 @@ def _extract_symbol_name(node, language: str) -> Optional[str]:
                 return name
         return None
 
+    # Rust impl blocks: extract the type being implemented
+    if node.type == "impl_item":
+        for child in node.children:
+            if child.type == "type_identifier":
+                return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+            # impl Trait for Type — grab the Type
+            if child.type == "generic_type" or child.type == "scoped_type_identifier":
+                text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+                return text
+        return None
+
+    # Go type declarations: type Name struct/interface
+    if node.type == "type_declaration":
+        for child in node.children:
+            if child.type == "type_spec":
+                # type_spec contains the type name as type_identifier
+                for spec_child in child.children:
+                    if spec_child.type == "type_identifier":
+                        return spec_child.text.decode("utf-8") if isinstance(spec_child.text, bytes) else spec_child.text
+                return _extract_symbol_name(child, language)
+        return None
+
+    # C/C++ template declarations: look at the inner declaration
+    if node.type == "template_declaration":
+        for child in node.children:
+            name = _extract_symbol_name(child, language)
+            if name:
+                return name
+        return None
+
+    # C/C++ struct/enum specifiers and class specifiers
+    if node.type in ("struct_specifier", "enum_specifier", "class_specifier",
+                      "namespace_definition"):
+        for child in node.children:
+            if child.type in ("type_identifier", "name", "identifier",
+                              "namespace_identifier"):
+                return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+        return None
+
+    # C type_definition: typedef ... Name;
+    if node.type == "type_definition":
+        for child in node.children:
+            if child.type == "type_identifier":
+                return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+        return None
+
+    # C/C++ function_definition: name is inside function_declarator child
+    if node.type == "function_definition":
+        for child in node.children:
+            if child.type == "function_declarator":
+                for fc_child in child.children:
+                    if fc_child.type in ("identifier", "field_identifier",
+                                          "qualified_identifier", "destructor_name"):
+                        return fc_child.text.decode("utf-8") if isinstance(fc_child.text, bytes) else fc_child.text
+                # function_declarator found but no identifier inside — fall through
+                break
+
     # Look for a 'name' or 'identifier' child
     for child in node.children:
-        if child.type in ("identifier", "property_identifier", "type_identifier"):
+        if child.type in ("identifier", "property_identifier", "type_identifier",
+                          "name", "field_identifier", "constant"):
             return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
 
     return None
@@ -184,12 +388,20 @@ def _node_to_chunk_type(node_type: str, is_method: bool = False) -> ChunkType:
         return ChunkType.METHOD
     if "class" in node_type:
         return ChunkType.CLASS
-    if "function" in node_type:
+    if "function" in node_type or node_type in ("method", "singleton_method",
+                                                  "method_declaration"):
         return ChunkType.FUNCTION
-    # Declarations that aren't functions or classes
+    if node_type in ("impl_item", "trait_item", "struct_item", "enum_item",
+                      "struct_specifier", "class_specifier", "enum_specifier",
+                      "interface_declaration", "enum_declaration",
+                      "record_declaration", "annotation_type_declaration",
+                      "trait_declaration", "module", "namespace_definition"):
+        return ChunkType.CLASS
     if node_type in (
         "lexical_declaration", "export_statement",
-        "interface_declaration", "type_alias_declaration",
+        "type_alias_declaration", "type_declaration",
+        "type_item", "const_item", "static_item", "macro_definition",
+        "type_definition", "declaration", "template_declaration",
     ):
         return ChunkType.MODULE_LEVEL
     return ChunkType.UNKNOWN
@@ -368,7 +580,13 @@ def chunk_code_with_treesitter(
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
         symbol = _extract_symbol_name(node, language)
-        is_class = "class" in node.type
+        is_class = "class" in node.type or node.type in (
+            "impl_item", "trait_item", "struct_item", "enum_item",
+            "struct_specifier", "class_specifier", "enum_specifier",
+            "interface_declaration", "enum_declaration",
+            "record_declaration", "trait_declaration", "module",
+            "namespace_definition",
+        )
 
         # For classes, try to extract methods as separate chunks
         if is_class and count_tokens(node_text) > max_tokens:
@@ -481,7 +699,9 @@ def _chunk_class_node(
     # Find the class body node
     body_node = None
     for child in class_node.children:
-        if child.type in ("block", "class_body", "statement_block"):
+        if child.type in ("block", "class_body", "statement_block",
+                          "field_declaration_list", "declaration_list",
+                          "body", "enum_body"):
             body_node = child
             break
 
