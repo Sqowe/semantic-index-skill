@@ -14,6 +14,8 @@ class ChunkType(Enum):
     MODULE_LEVEL = "module_level"
     MARKDOWN_SECTION = "markdown_section"
     MARKDOWN_FRONTMATTER = "markdown_frontmatter"
+    DITA_TOPIC = "dita_topic"
+    DITA_MAP = "dita_map"
     UNKNOWN = "unknown"
 
 

@@ -127,6 +127,25 @@ def analyze_config(config: dict) -> list[dict]:
             "new_value": "1.0",
         })
 
+    # Check for missing DITA file extensions (Phase 5)
+    indexing = config.get("indexing", {})
+    file_extensions = indexing.get("file_extensions")
+    if file_extensions is None:
+        file_extensions = []
+    dita_extensions = [".dita", ".ditamap"]
+    missing_dita = [ext for ext in dita_extensions if ext not in file_extensions]
+    if missing_dita:
+        migrations.append({
+            "field": "indexing.file_extensions",
+            "action": "update" if file_extensions else "add",
+            "reason": (
+                f"Phase 5 DITA support: add {', '.join(missing_dita)} "
+                "to enable DITA documentation indexing."
+            ),
+            "old_value": file_extensions if file_extensions else None,
+            "new_value": file_extensions + missing_dita,
+        })
+
     return migrations
 
 

@@ -67,6 +67,8 @@ def detect_language(file_path: str) -> Optional[str]:
         ".mdx": "markdown",
         ".txt": "text",
         ".rst": "rst",
+        ".dita": "dita",
+        ".ditamap": "ditamap",
     }
     ext = os.path.splitext(file_path)[1].lower()
     return ext_map.get(ext)

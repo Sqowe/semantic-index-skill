@@ -61,6 +61,9 @@ def chunk_file(
     if language == "markdown":
         from .chunkers.markdown import chunk_markdown
         return chunk_markdown(content, file_path, config)
+    elif language in ("dita", "ditamap"):
+        from .chunkers.dita import chunk_dita
+        return chunk_dita(content, file_path, language, config)
     elif language in TREESITTER_LANGUAGES:
         from .chunkers.code import chunk_code_with_treesitter
         return chunk_code_with_treesitter(content, file_path, language, config)

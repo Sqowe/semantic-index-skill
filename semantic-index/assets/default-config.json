@@ -23,7 +23,8 @@
       ".py", ".js", ".ts", ".tsx", ".jsx",
       ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
       ".rb", ".php",
-      ".md", ".mdx", ".txt", ".rst"
+      ".md", ".mdx", ".txt", ".rst",
+      ".dita", ".ditamap"
     ],
     "exclude_patterns": [
       "node_modules/", "venv/", ".venv/", "__pycache__/",
