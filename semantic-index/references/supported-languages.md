@@ -99,7 +99,7 @@ Languages without a Tree-sitter grammar fall back to blank-line splitting.
 | Grammar package | `tree-sitter-cpp` |
 | File extensions | `.cpp`, `.hpp` |
 | Top-level nodes | `function_definition`, `class_specifier`, `struct_specifier`, `enum_specifier`, `namespace_definition`, `template_declaration`, `type_definition`, `declaration` |
-| Method nodes | `function_definition`, `declaration` (inside class body) |
+| Method nodes | `function_definition` (inside class body); `field_declaration` nodes containing a `function_declarator` are also recognized as methods during oversized class splitting |
 | Body node types | `field_declaration_list`, `declaration_list` |
 | Notes | C++ classes use `field_declaration_list` as their body node. `namespace_definition` is treated as a class-like container for method extraction. `template_declaration` wraps templated functions/classes. |
 
