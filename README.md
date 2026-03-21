@@ -7,7 +7,7 @@ Instead of grep/glob for exact string matches, this skill lets you search code b
 ## How It Works
 
 1. Scans your project for supported files (code + markdown)
-2. Chunks files using AST-aware splitting (Tree-sitter for code, header-based for markdown)
+2. Chunks files using AST-aware splitting (Tree-sitter for code, header-based for markdown, XML-aware for DITA)
 3. Embeds chunks via the configured provider (OpenRouter API or local HuggingFace)
 4. Stores embeddings locally in `.index/` (LanceDB vectors + BM25 keyword index)
 5. Searches using hybrid retrieval (vector similarity + BM25 keyword matching, merged via Reciprocal Rank Fusion)
@@ -460,6 +460,13 @@ AST-aware chunking via Tree-sitter is available for 10 languages:
 | Ruby | `.rb` | modules, classes, methods |
 | PHP | `.php` | classes, functions, methods |
 
+DITA XML documentation is also supported with XML-aware chunking:
+
+| Language | Extensions | Key constructs extracted |
+|----------|-----------|------------------------|
+| DITA | `.dita` | topics (concept, task, reference, glossentry, troubleshooting), prolog metadata, sections |
+| DITA Map | `.ditamap` | navigation hierarchy, topicref structure |
+
 Markdown files (`.md`, `.mdx`) use header-based chunking. All other text files matching configured extensions fall back to blank-line splitting.
 
 ## Project Structure
@@ -490,6 +497,7 @@ semantic-index/
         │   ├── __init__.py
         │   ├── common.py       # Shared chunking utilities
         │   ├── code.py         # Tree-sitter AST-aware code chunking
+        │   ├── dita.py         # XML-aware DITA documentation chunking
         │   └── markdown.py     # Header-based markdown chunking
         ├── embedder.py         # EmbeddingProvider ABC, factory, cache
         ├── providers/

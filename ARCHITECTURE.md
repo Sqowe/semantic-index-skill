@@ -1236,20 +1236,20 @@ DITA (Darwin Information Typing Architecture) is an OASIS open standard for stru
 technical documentation. Files are XML with predictable topic-based structure, making them
 well-suited for semantic chunking — each topic covers a single subject by design.
 
-| Step | Task | Details |
-|------|------|---------|
-| 5.1 | Create `lib/chunkers/dita.py` | XML-aware DITA parser using Python's built-in `xml.etree.ElementTree`. No external dependencies needed. |
-| 5.2 | Register DITA file extensions | Add `.dita` and `.ditamap` to default `file_extensions` in config and to chunker dispatch logic. |
-| 5.3 | Implement topic-level chunking | Split on `<topic>`, `<concept>`, `<task>`, `<reference>`, `<glossentry>`, `<troubleshooting>` boundaries. Each topic = one chunk (unless it exceeds `chunk_max_tokens`). |
-| 5.4 | Extract `<prolog>` metadata | Parse `<keywords>`, `<audience>`, `<category>`, `<author>` from `<prolog>` elements. Prepend as context to chunk text to enrich embedding quality (e.g., `[audience: admin] [keywords: installation, upgrade] ...`). |
-| 5.5 | Implement section-level splitting | When a single topic exceeds `chunk_max_tokens`, split at `<section>` boundaries within `<body>` / `<taskbody>` / `<conbody>` / `<refbody>`. Preserve parent `<title>` as context in each sub-chunk. |
-| 5.6 | Implement XML text extraction | Strip XML tags for embedding text while preserving original XML in the stored chunk. Concatenate text from `<title>`, `<shortdesc>`, `<p>`, `<li>`, `<step>`, `<cmd>`, `<codeblock>`, `<note>`, etc. Maintain natural reading order. |
-| 5.7 | Handle `.ditamap` files | Parse `<topicref>` hierarchy to extract navigation structure, topic titles, and `navtitle` attributes. Index as a single "map overview" chunk per ditamap — useful for queries like "where is the installation guide?" |
-| 5.8 | Handle DITA specializations | Custom topic types (industry-specific) extend the base `<topic>` element. Use generic `<topic>` detection as fallback — if the root or any descendant matches `<topic>` or has `class` attribute containing `topic/topic`, treat it as a topic. |
-| 5.9 | Handle `xml:lang` propagation | DITA supports `xml:lang` at any element level, inherited by children. Extract and store language info as chunk metadata. Pair with multilingual embedding model (BGE-M3) for cross-lingual DITA search. |
-| 5.10 | Handle content references (conref) | For MVP: index raw file content without resolving conrefs. The referenced text will be indexed from its source file. Add a note in chunk metadata when `conref` or `conkeyref` attributes are detected, so search results can indicate partial content. |
-| 5.11 | Update `references/supported-languages.md` | Add DITA section documenting supported topic types, recognized elements, and chunking behavior. |
-| 5.12 | Test with real DITA content | Validate with concept, task, reference, and glossary entry topics. Verify ditamap indexing. Test multilingual DITA sets with `xml:lang` attributes. |
+| Step | Task | Details | Status |
+|------|------|---------|--------|
+| 5.1 | Create `lib/chunkers/dita.py` | XML-aware DITA parser using Python's built-in `xml.etree.ElementTree`. No external dependencies needed. | ✅ Done |
+| 5.2 | Register DITA file extensions | Add `.dita` and `.ditamap` to default `file_extensions` in config and to chunker dispatch logic. | ✅ Done |
+| 5.3 | Implement topic-level chunking | Split on `<topic>`, `<concept>`, `<task>`, `<reference>`, `<glossentry>`, `<troubleshooting>` boundaries. Each topic = one chunk (unless it exceeds `chunk_max_tokens`). | ✅ Done |
+| 5.4 | Extract `<prolog>` metadata | Parse `<keywords>`, `<audience>`, `<category>`, `<author>` from `<prolog>` elements. Prepend as context to chunk text to enrich embedding quality (e.g., `[audience: admin] [keywords: installation, upgrade] ...`). | ✅ Done |
+| 5.5 | Implement section-level splitting | When a single topic exceeds `chunk_max_tokens`, split at `<section>` boundaries within `<body>` / `<taskbody>` / `<conbody>` / `<refbody>`. Preserve parent `<title>` as context in each sub-chunk. | ✅ Done |
+| 5.6 | Implement XML text extraction | Strip XML tags for embedding text while preserving original XML in the stored chunk. Concatenate text from `<title>`, `<shortdesc>`, `<p>`, `<li>`, `<step>`, `<cmd>`, `<codeblock>`, `<note>`, etc. Maintain natural reading order. | ✅ Done |
+| 5.7 | Handle `.ditamap` files | Parse `<topicref>` hierarchy to extract navigation structure, topic titles, and `navtitle` attributes. Index as a single "map overview" chunk per ditamap — useful for queries like "where is the installation guide?" | ✅ Done |
+| 5.8 | Handle DITA specializations | Custom topic types (industry-specific) extend the base `<topic>` element. Use generic `<topic>` detection as fallback — if the root or any descendant matches `<topic>` or has `class` attribute containing `topic/topic`, treat it as a topic. | ✅ Done |
+| 5.9 | Handle `xml:lang` propagation | DITA supports `xml:lang` at any element level, inherited by children. Extract and store language info as chunk metadata. Pair with multilingual embedding model (BGE-M3) for cross-lingual DITA search. | ✅ Done |
+| 5.10 | Handle content references (conref) | For MVP: index raw file content without resolving conrefs. The referenced text will be indexed from its source file. Add a note in chunk metadata when `conref` or `conkeyref` attributes are detected, so search results can indicate partial content. | ✅ Done |
+| 5.11 | Update `references/supported-languages.md` | Add DITA section documenting supported topic types, recognized elements, and chunking behavior. | ✅ Done |
+| 5.12 | Test with real DITA content | Validate with concept, task, reference, and glossary entry topics. Verify ditamap indexing. Test multilingual DITA sets with `xml:lang` attributes. | ✅ Done |
 
 **Chunking strategy summary for `dita.py`:**
 
