@@ -31,20 +31,24 @@ logger = logging.getLogger(__name__)
 INDEX_DIR_NAME = ".index"
 CONFIG_FILENAME = "config.json"
 
-# Current schema defaults for the search section (Phase 3)
+# Current schema defaults for the search section (Phase 3+4)
 SEARCH_DEFAULTS = {
     "default_top_k": 10,
     "default_threshold": 0.3,
     "mode": "hybrid",
     "hybrid_alpha": 0.7,
+    "rerank_enabled": False,
+    "rerank_model": "BAAI/bge-reranker-v2-m3",
+    "rerank_top_n": 10,
+}
+
+# Embedding fields added in Phase 4
+EMBEDDING_DEFAULTS = {
+    "device": None,
 }
 
 # Fields that should be removed (deprecated or moved to future phases)
-DEPRECATED_SEARCH_FIELDS = [
-    "rerank_enabled",
-    "rerank_model",
-    "rerank_top_n",
-]
+DEPRECATED_SEARCH_FIELDS: list[str] = []
 
 
 def _handle_error(error: Exception, exit_code: int = 1) -> None:
@@ -75,14 +79,27 @@ def analyze_config(config: dict) -> list[dict]:
     """
     migrations: list[dict] = []
     search = config.get("search", {})
+    embedding = config.get("embedding", {})
 
-    # Check for missing Phase 3 fields
+    # Check for missing search fields (Phase 3 + Phase 4 rerank)
     for field, default_value in SEARCH_DEFAULTS.items():
         if field not in search:
+            phase = "Phase 4 reranker" if field.startswith("rerank") else "Phase 3 hybrid search"
             migrations.append({
                 "field": f"search.{field}",
                 "action": "add",
-                "reason": f"New Phase 3 hybrid search field. Default: {default_value!r}",
+                "reason": f"New {phase} field. Default: {default_value!r}",
+                "old_value": None,
+                "new_value": default_value,
+            })
+
+    # Check for missing embedding fields (Phase 4)
+    for field, default_value in EMBEDDING_DEFAULTS.items():
+        if field not in embedding:
+            migrations.append({
+                "field": f"embedding.{field}",
+                "action": "add",
+                "reason": f"New Phase 4 embedding field. Default: {default_value!r}",
                 "old_value": None,
                 "new_value": default_value,
             })
@@ -93,10 +110,7 @@ def analyze_config(config: dict) -> list[dict]:
             migrations.append({
                 "field": f"search.{field}",
                 "action": "remove",
-                "reason": (
-                    "Reranking deferred to Phase 4 (requires local sentence-transformers). "
-                    "This field has no effect and will be ignored."
-                ),
+                "reason": "Deprecated field. This field has no effect and will be ignored.",
                 "old_value": search[field],
                 "new_value": None,
             })

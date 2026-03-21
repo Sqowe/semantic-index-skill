@@ -9,7 +9,9 @@
     "query_prefix": "",
     "document_prefix": "",
     "max_retries": 3,
-    "retry_delay_seconds": 1.0
+    "retry_delay_seconds": 1.0,
+    "device": null,
+    "trust_remote_code": false
   },
   "chunking": {
     "max_tokens": 512,
@@ -37,6 +39,9 @@
     "default_top_k": 10,
     "default_threshold": 0.3,
     "mode": "hybrid",
-    "hybrid_alpha": 0.7
+    "hybrid_alpha": 0.7,
+    "rerank_enabled": false,
+    "rerank_model": "BAAI/bge-reranker-v2-m3",
+    "rerank_top_n": 10
   }
 }
