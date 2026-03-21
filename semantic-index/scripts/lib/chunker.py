@@ -18,8 +18,11 @@ from .models import Chunk
 
 logger = logging.getLogger(__name__)
 
-# Languages supported by Tree-sitter in Phase 1
-TREESITTER_LANGUAGES = {"python", "javascript", "typescript"}
+# Languages supported by Tree-sitter (Phase 1 + Phase 2)
+TREESITTER_LANGUAGES = {
+    "python", "javascript", "typescript",
+    "go", "rust", "java", "c", "cpp", "ruby", "php",
+}
 
 
 def chunk_file(
