@@ -45,6 +45,7 @@ SEARCH_DEFAULTS = {
 # Embedding fields added in Phase 4
 EMBEDDING_DEFAULTS = {
     "device": None,
+    "trust_remote_code": False,
 }
 
 # Fields that should be removed (deprecated or moved to future phases)

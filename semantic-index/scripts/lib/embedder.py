@@ -60,7 +60,7 @@ class EmbeddingProvider(ABC):
 # Provider factory
 # ---------------------------------------------------------------------------
 
-def create_embedder(config: Config) -> EmbeddingProvider:
+def create_provider(config: Config) -> EmbeddingProvider:
     """Factory: instantiate the right provider based on config.embedding.provider.
 
     Supported providers:
@@ -94,6 +94,17 @@ def create_embedder(config: Config) -> EmbeddingProvider:
             f"Unknown embedding provider: {provider!r}. "
             "Supported: 'openrouter', 'huggingface'"
         )
+
+
+def create_embedder(config: Config) -> EmbeddingProvider:
+    """Deprecated: use create_provider() instead."""
+    import warnings
+    warnings.warn(
+        "create_embedder() is deprecated, use create_provider()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return create_provider(config)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +199,7 @@ class Embedder:
 
     def __init__(self, config: Config, project_dir: Optional[str] = None) -> None:
         self._config = config
-        self._provider = create_embedder(config)
+        self._provider = create_provider(config)
         self._cache: Optional[EmbeddingCache] = None
 
         if project_dir:

@@ -2,7 +2,7 @@
 and reranker config flow.
 
 Covers review issues:
-- Provider selection via create_embedder()
+- Provider selection via create_provider()
 - Invalid provider raises EmbeddingError
 - trust_remote_code defaults to False and is config-driven
 - HuggingFace dimension validation against model output
@@ -11,6 +11,7 @@ Covers review issues:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -23,7 +24,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.config import Config, EmbeddingConfig, SearchConfig, load_config
-from lib.embedder import create_embedder
+from lib.embedder import create_provider
 from lib.models import EmbeddingError
 
 
@@ -63,15 +64,15 @@ def mock_sentence_transformers():
 # Provider factory tests
 # ---------------------------------------------------------------------------
 
-class TestCreateEmbedder:
-    """Tests for the create_embedder() factory function."""
+class TestCreateProvider:
+    """Tests for the create_provider() factory function."""
 
     @patch("lib.providers.openrouter.OpenRouterProvider")
     def test_selects_openrouter(self, mock_cls):
         """Factory returns OpenRouterProvider when config says 'openrouter'."""
         config = Config()
         config.embedding = EmbeddingConfig(provider="openrouter", api_key="test-key")
-        create_embedder(config)
+        create_provider(config)
         mock_cls.assert_called_once_with(config)
 
     @patch("lib.providers.huggingface.HuggingFaceProvider")
@@ -79,7 +80,7 @@ class TestCreateEmbedder:
         """Factory returns HuggingFaceProvider when config says 'huggingface'."""
         config = Config()
         config.embedding = EmbeddingConfig(provider="huggingface")
-        create_embedder(config)
+        create_provider(config)
         mock_cls.assert_called_once_with(config)
 
     def test_unknown_provider_raises(self):
@@ -87,7 +88,7 @@ class TestCreateEmbedder:
         config = Config()
         config.embedding = EmbeddingConfig(provider="ollama")
         with pytest.raises(EmbeddingError, match="Unknown embedding provider"):
-            create_embedder(config)
+            create_provider(config)
 
 
 # ---------------------------------------------------------------------------
@@ -314,3 +315,354 @@ class TestSemanticSearchRerankerWiring:
                 device="cpu",
                 trust_remote_code=True,
             )
+
+
+# ---------------------------------------------------------------------------
+# Config migration: trust_remote_code coverage
+# ---------------------------------------------------------------------------
+
+class TestMigrationTrustRemoteCode:
+    """Tests that migrate_config adds trust_remote_code to embedding section."""
+
+    def test_migration_adds_trust_remote_code(self):
+        """Config missing trust_remote_code gets a migration entry."""
+        from migrate_config import analyze_config
+
+        config = {
+            "schema_version": "1.0",
+            "embedding": {
+                "provider": "openrouter",
+                "model": "test-model",
+                "device": None,
+                # trust_remote_code intentionally missing
+            },
+            "search": {
+                "default_top_k": 10,
+                "default_threshold": 0.3,
+                "mode": "hybrid",
+                "hybrid_alpha": 0.7,
+                "rerank_enabled": False,
+                "rerank_model": "BAAI/bge-reranker-v2-m3",
+                "rerank_top_n": 10,
+            },
+        }
+
+        migrations = analyze_config(config)
+        trust_migrations = [
+            m for m in migrations if m["field"] == "embedding.trust_remote_code"
+        ]
+        assert len(trust_migrations) == 1
+        assert trust_migrations[0]["action"] == "add"
+        assert trust_migrations[0]["new_value"] is False
+
+    def test_migration_adds_both_device_and_trust(self):
+        """Config missing both device and trust_remote_code gets both."""
+        from migrate_config import analyze_config, apply_migrations
+
+        config = {
+            "schema_version": "1.0",
+            "embedding": {"provider": "openrouter"},
+            "search": {
+                "default_top_k": 10,
+                "default_threshold": 0.3,
+                "mode": "hybrid",
+                "hybrid_alpha": 0.7,
+                "rerank_enabled": False,
+                "rerank_model": "BAAI/bge-reranker-v2-m3",
+                "rerank_top_n": 10,
+            },
+        }
+
+        migrations = analyze_config(config)
+        embedding_fields = [m["field"] for m in migrations if m["field"].startswith("embedding.")]
+        assert "embedding.device" in embedding_fields
+        assert "embedding.trust_remote_code" in embedding_fields
+
+        updated = apply_migrations(config, migrations)
+        assert updated["embedding"]["device"] is None
+        assert updated["embedding"]["trust_remote_code"] is False
+
+    def test_migration_skips_when_trust_present(self):
+        """Config that already has trust_remote_code gets no migration for it."""
+        from migrate_config import analyze_config
+
+        config = {
+            "schema_version": "1.0",
+            "embedding": {
+                "provider": "openrouter",
+                "device": None,
+                "trust_remote_code": True,
+            },
+            "search": {
+                "default_top_k": 10,
+                "default_threshold": 0.3,
+                "mode": "hybrid",
+                "hybrid_alpha": 0.7,
+                "rerank_enabled": False,
+                "rerank_model": "BAAI/bge-reranker-v2-m3",
+                "rerank_top_n": 10,
+            },
+        }
+
+        migrations = analyze_config(config)
+        trust_migrations = [
+            m for m in migrations if m["field"] == "embedding.trust_remote_code"
+        ]
+        assert len(trust_migrations) == 0
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter Retry-After header edge cases
+# ---------------------------------------------------------------------------
+
+class TestOpenRouterRetryAfter:
+    """Tests for Retry-After header parsing in OpenRouterProvider."""
+
+    def _make_provider(self):
+        """Create an OpenRouterProvider with test config."""
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="openrouter",
+            api_key="test-key",
+            max_retries=2,
+            retry_delay_seconds=0.01,
+        )
+        from lib.providers.openrouter import OpenRouterProvider
+        return OpenRouterProvider(config)
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_numeric_retry_after_is_used(self, mock_post):
+        """Numeric Retry-After header is parsed and used."""
+        # First call: 429 with numeric Retry-After
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "2"}
+
+        # Second call: success
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            # Should have slept with the parsed Retry-After value
+            mock_sleep.assert_called_with(2.0)
+        assert result == [[0.1, 0.2]]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_http_date_retry_after_falls_back(self, mock_post):
+        """HTTP-date Retry-After falls back to exponential backoff."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "Sat, 21 Mar 2026 12:00:00 GMT"}
+
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            # Should fall back to retry_delay * 2^0 = 0.01
+            mock_sleep.assert_called_with(0.01)
+        assert result == [[0.1, 0.2]]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_missing_retry_after_uses_backoff(self, mock_post):
+        """Missing Retry-After header uses exponential backoff."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            mock_sleep.assert_called_with(0.01)
+        assert result == [[0.1, 0.2]]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_negative_retry_after_falls_back(self, mock_post):
+        """Negative Retry-After value falls back to exponential backoff."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "-5"}
+
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            mock_sleep.assert_called_with(0.01)
+        assert result == [[0.1, 0.2]]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_inf_retry_after_falls_back(self, mock_post):
+        """Inf Retry-After value falls back to exponential backoff."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "inf"}
+
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            mock_sleep.assert_called_with(0.01)
+        assert result == [[0.1, 0.2]]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_nan_retry_after_falls_back(self, mock_post):
+        """NaN Retry-After value falls back to exponential backoff."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "nan"}
+
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.raise_for_status = MagicMock()
+        resp_ok.json.return_value = {
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        }
+
+        mock_post.side_effect = [resp_429, resp_ok]
+
+        provider = self._make_provider()
+        with patch("lib.providers.openrouter.time.sleep") as mock_sleep:
+            result = provider.embed_texts(["test"])
+            mock_sleep.assert_called_with(0.01)
+        assert result == [[0.1, 0.2]]
+
+
+# ---------------------------------------------------------------------------
+# Reranker: missing content handling
+# ---------------------------------------------------------------------------
+
+class TestRerankerMissingContent:
+    """Tests for reranker behavior when results are missing content."""
+
+    def test_missing_content_skipped(self, mock_sentence_transformers):
+        """Results without 'content' are skipped, not crashed on."""
+        mock_model = MagicMock()
+        mock_model.predict.return_value = [0.9]
+        mock_sentence_transformers.CrossEncoder.return_value = mock_model
+
+        from lib.reranker import Reranker
+
+        reranker = Reranker(model_name="test-reranker")
+        results = [
+            {"id": "c1", "content": "valid doc"},
+            {"id": "c2"},  # missing content
+            {"id": "c3", "content": ""},  # empty content
+        ]
+        reranked = reranker.rerank("query", results, top_n=5)
+
+        # Only the result with actual content should be scored
+        assert len(reranked) == 1
+        assert reranked[0]["id"] == "c1"
+        mock_model.predict.assert_called_once_with([("query", "valid doc")])
+
+    def test_all_missing_content_returns_empty(self, mock_sentence_transformers):
+        """If all results lack content, returns empty without loading model."""
+        from lib.reranker import Reranker
+
+        reranker = Reranker(model_name="test-reranker")
+        results = [{"id": "c1"}, {"id": "c2", "content": ""}]
+        reranked = reranker.rerank("query", results, top_n=5)
+        assert reranked == []
+        assert reranker._model is None  # Model never loaded
+        mock_sentence_transformers.CrossEncoder.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SEMANTIC_INDEX_PROVIDER env var override
+# ---------------------------------------------------------------------------
+
+class TestProviderEnvOverride:
+    """Tests for SEMANTIC_INDEX_PROVIDER environment variable override."""
+
+    def test_env_overrides_config_provider(self, tmp_path):
+        """SEMANTIC_INDEX_PROVIDER env var overrides config file provider."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {
+            "schema_version": "1.0",
+            "embedding": {"provider": "openrouter"},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        with patch.dict(os.environ, {"SEMANTIC_INDEX_PROVIDER": "huggingface"}):
+            config = load_config(str(tmp_path))
+            assert config.embedding.provider == "huggingface"
+
+    def test_invalid_provider_env_raises(self, tmp_path):
+        """Invalid SEMANTIC_INDEX_PROVIDER raises ConfigError at validation."""
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {"schema_version": "1.0", "embedding": {"provider": "openrouter"}}
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        with patch.dict(os.environ, {"SEMANTIC_INDEX_PROVIDER": "invalid_provider"}):
+            with pytest.raises(CfgErr, match="Invalid embedding.provider"):
+                load_config(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: create_embedder deprecation shim
+# ---------------------------------------------------------------------------
+
+class TestCreateEmbedderDeprecation:
+    """Tests that the deprecated create_embedder() shim still works."""
+
+    @patch("lib.providers.openrouter.OpenRouterProvider")
+    def test_create_embedder_dispatches_correctly(self, mock_cls):
+        """create_embedder() delegates to create_provider() and returns a provider."""
+        import warnings
+        from lib.embedder import create_embedder
+
+        config = Config()
+        config.embedding = EmbeddingConfig(provider="openrouter", api_key="test-key")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            create_embedder(config)
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "create_provider" in str(w[0].message)
+
+        mock_cls.assert_called_once_with(config)
