@@ -194,6 +194,16 @@ tests/fixtures/
 data/large-dataset.json
 ```
 
+### Excluding Previously Indexed Directories
+
+If you add a directory to `exclude_patterns` (or `.indexignore`) after it has already been indexed, the next `build_index.py` run will automatically clean up:
+
+1. The file walker skips the now-excluded directory, so those files no longer appear in the current file set.
+2. The change detector compares the current files against the stored manifest and marks any manifest entries missing from the current set as deletions.
+3. The indexer removes the corresponding chunks from both the vector store and the BM25 keyword index, then drops the files from the manifest.
+
+After that run, searches will no longer return results from the excluded directory. No `--full` rebuild is needed — incremental indexing handles it.
+
 ### Local Embedding (HuggingFace Provider)
 
 Instead of calling the OpenRouter API, you can run embeddings locally using sentence-transformers. This is free, works offline, and keeps all data on your machine.
