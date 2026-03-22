@@ -16,6 +16,9 @@ class ChunkType(Enum):
     MARKDOWN_FRONTMATTER = "markdown_frontmatter"
     DITA_TOPIC = "dita_topic"
     DITA_MAP = "dita_map"
+    PDF_PAGE = "pdf_page"
+    DOCX_SECTION = "docx_section"
+    PPTX_SLIDE = "pptx_slide"
     UNKNOWN = "unknown"
 
 

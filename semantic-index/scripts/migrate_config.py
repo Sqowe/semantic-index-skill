@@ -149,6 +149,37 @@ def analyze_config(config: dict) -> list[dict]:
             "new_value": file_extensions + missing_dita,
         })
 
+    # Check for missing office file extensions (Phase 9)
+    # Re-read extensions in case DITA migration updated them
+    current_exts = file_extensions + missing_dita
+    office_extensions = [".pdf", ".docx", ".pptx"]
+    missing_office = [ext for ext in office_extensions if ext not in current_exts]
+    if missing_office:
+        migrations.append({
+            "field": "indexing.file_extensions",
+            "action": "update" if current_exts else "add",
+            "reason": (
+                f"Phase 9 office document support: add {', '.join(missing_office)} "
+                "to enable PDF, DOCX, and PPTX indexing."
+            ),
+            "old_value": current_exts if current_exts else None,
+            "new_value": current_exts + missing_office,
+        })
+
+    # Check for missing max_office_file_size_kb (Phase 9)
+    if "max_office_file_size_kb" not in indexing:
+        migrations.append({
+            "field": "indexing.max_office_file_size_kb",
+            "action": "add",
+            "reason": (
+                "Phase 9 office document support: separate size limit for "
+                "binary office files (default 50MB). Office files are inherently "
+                "larger than source code files."
+            ),
+            "old_value": None,
+            "new_value": 50000,
+        })
+
     return migrations
 
 

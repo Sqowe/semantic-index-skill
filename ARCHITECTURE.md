@@ -1686,18 +1686,18 @@ Installed via `setup.sh --with-office` (same pattern as `--with-huggingface`).
 
 | Step | Task | Details | Status |
 |------|------|---------|--------|
-| 9.1 | Create `requirements-office.txt` | `PyMuPDF>=1.24.0`, `python-docx>=1.1.0`, `python-pptx>=1.0.0` | ⬜ |
-| 9.2 | Update `setup.sh` | Add `--with-office` flag, same pattern as `--with-huggingface` | ⬜ |
-| 9.3 | Add `ChunkType` values | `PDF_PAGE`, `DOCX_SECTION`, `PPTX_SLIDE` in `models.py` | ⬜ |
-| 9.4 | Add office extensions to `detect_language()` | `.pdf`, `.docx`, `.pptx` in `chunkers/common.py` | ⬜ |
-| 9.5 | Add office extensions to `default-config.json` | Append to `file_extensions` array | ⬜ |
-| 9.6 | Update `chunk_file()` dispatch | Binary format detection, skip `read_text()`, delegate to `chunk_office()` | ⬜ |
-| 9.7 | Implement `_chunk_pdf()` | PyMuPDF page extraction, page merging/splitting, metadata | ⬜ |
-| 9.8 | Implement `_chunk_docx()` | python-docx heading-based sectioning, table text, metadata | ⬜ |
-| 9.9 | Implement `_chunk_pptx()` | python-pptx slide extraction, notes, table text, metadata | ⬜ |
-| 9.10 | Implement `chunk_office()` dispatch | Format routing, lazy imports, clear error on missing deps | ⬜ |
-| 9.11 | Add `max_office_file_size_kb` config field | Default 50000 (50MB). Add to `IndexingConfig`, `default-config.json`, `migrate_config.py`. | ⬜ |
-| 9.12 | Update `references/supported-languages.md` | Add office document section with supported formats and limitations | ⬜ |
+| 9.1 | Create `requirements-office.txt` | `PyMuPDF>=1.24.0`, `python-docx>=1.1.0`, `python-pptx>=1.0.0` | ✅ Done |
+| 9.2 | Update `setup.sh` | Add `--with-office` flag, same pattern as `--with-huggingface` | ✅ Done |
+| 9.3 | Add `ChunkType` values | `PDF_PAGE`, `DOCX_SECTION`, `PPTX_SLIDE` in `models.py` | ✅ Done |
+| 9.4 | Add office extensions to `detect_language()` | `.pdf`, `.docx`, `.pptx` in `chunkers/common.py` | ✅ Done |
+| 9.5 | Add office extensions to `default-config.json` | Append to `file_extensions` array | ✅ Done |
+| 9.6 | Update `chunk_file()` dispatch | Binary format detection, skip `read_text()`, delegate to `chunk_office()` | ✅ Done |
+| 9.7 | Implement `_chunk_pdf()` | PyMuPDF page extraction, page merging/splitting, metadata | ✅ Done |
+| 9.8 | Implement `_chunk_docx()` | python-docx heading-based sectioning, table text, metadata | ✅ Done |
+| 9.9 | Implement `_chunk_pptx()` | python-pptx slide extraction, notes, table text, metadata | ✅ Done |
+| 9.10 | Implement `chunk_office()` dispatch | Format routing, lazy imports, clear error on missing deps | ✅ Done |
+| 9.11 | Add `max_office_file_size_kb` config field | Default 50000 (50MB). Add to `IndexingConfig`, `default-config.json`, `migrate_config.py`. | ✅ Done |
+| 9.12 | Update `references/supported-languages.md` | Add office document section with supported formats and limitations | ✅ Done |
 | 9.13 | Write tests for office chunker | Test each format with sample files, edge cases (empty, huge, encrypted) | ⬜ |
 | 9.14 | End-to-end test: index + search a project with mixed code and office docs | Verify office chunks appear in search results alongside code/markdown | ⬜ |
 
