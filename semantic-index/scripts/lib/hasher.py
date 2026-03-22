@@ -98,6 +98,8 @@ def walk_project_files(project_dir: str, config: Config) -> list[str]:
     indexignore_spec = _load_indexignore_spec(project_path)
     exclude_spec = _build_exclude_spec(config)
     max_size = config.indexing.max_file_size_kb * 1024
+    max_office_size = config.indexing.max_office_file_size_kb * 1024
+    office_extensions = {".pdf", ".docx", ".pptx"}
 
     files: list[str] = []
 
@@ -122,9 +124,11 @@ def walk_project_files(project_dir: str, config: Config) -> list[str]:
             if not _should_include(rel_path, config, gitignore_spec, indexignore_spec, exclude_spec):
                 continue
 
-            # Check file size
+            # Check file size (office files get a higher limit)
+            ext = os.path.splitext(filename)[1].lower()
+            size_limit = max_office_size if ext in office_extensions else max_size
             try:
-                if os.path.getsize(abs_path) > max_size:
+                if os.path.getsize(abs_path) > size_limit:
                     logger.debug("Skipping large file: %s", rel_path)
                     continue
             except OSError:

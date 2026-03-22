@@ -24,7 +24,8 @@
       ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
       ".rb", ".php",
       ".md", ".mdx", ".txt", ".rst",
-      ".dita", ".ditamap"
+      ".dita", ".ditamap",
+      ".pdf", ".docx", ".pptx"
     ],
     "exclude_patterns": [
       "node_modules/", "venv/", ".venv/", "__pycache__/",
@@ -34,6 +35,7 @@
       "*.pyc", "*.pyo", "*.so", "*.dylib"
     ],
     "max_file_size_kb": 500,
+    "max_office_file_size_kb": 50000,
     "respect_gitignore": true
   },
   "search": {

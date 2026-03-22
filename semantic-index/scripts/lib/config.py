@@ -64,6 +64,7 @@ class IndexingConfig:
         "*.pyc", "*.pyo", "*.so", "*.dylib",
     ])
     max_file_size_kb: int = 500
+    max_office_file_size_kb: int = 50000
     respect_gitignore: bool = True
 
 

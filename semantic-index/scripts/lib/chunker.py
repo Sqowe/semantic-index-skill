@@ -25,6 +25,10 @@ TREESITTER_LANGUAGES = {
 }
 
 
+# Binary formats that require specialized extraction (not UTF-8 text)
+BINARY_FORMATS = {"pdf", "docx", "pptx"}
+
+
 def chunk_file(
     file_path: str,
     project_dir: str,
@@ -33,6 +37,7 @@ def chunk_file(
     """Chunk a single file into semantically meaningful pieces.
 
     Dispatches to the appropriate chunking strategy based on language:
+    - Office documents (PDF/DOCX/PPTX): binary extraction via office chunker
     - Markdown files: header-based splitting
     - Python/JS/TS: Tree-sitter AST-aware splitting
     - Other: blank-line fallback splitting
@@ -46,6 +51,12 @@ def chunk_file(
         List of Chunk objects. May be empty if the file is too small.
     """
     abs_path = os.path.join(project_dir, file_path)
+    language = detect_language(file_path)
+
+    # Binary formats: delegate to office chunker (handles its own file I/O)
+    if language in BINARY_FORMATS:
+        from .chunkers.office import chunk_office
+        return chunk_office(abs_path, file_path, language, config)
 
     try:
         content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
@@ -55,8 +66,6 @@ def chunk_file(
 
     if not content.strip():
         return []
-
-    language = detect_language(file_path)
 
     if language == "markdown":
         from .chunkers.markdown import chunk_markdown

@@ -189,6 +189,57 @@ Structural/metadata-only elements are skipped:
 
 ---
 
+## Office Documents (PDF, DOCX, PPTX)
+
+Office documents use binary-format extraction via dedicated Python libraries.
+Text is extracted and chunked using format-aware strategies. Dependencies are
+optional — install via `bash setup.sh --with-office`.
+
+### Supported Formats
+
+| Format | Library | Chunking Strategy | Chunk Type |
+|--------|---------|-------------------|------------|
+| PDF | `PyMuPDF>=1.24.0` (`fitz`) | Page-based splitting | `pdf_page` |
+| DOCX | `python-docx>=1.1.0` | Heading-based sectioning | `docx_section` |
+| PPTX | `python-pptx>=1.0.0` | Slide-based splitting | `pptx_slide` |
+
+### PDF Chunking
+
+- Text extracted per page via `page.get_text("text")`
+- Document metadata (title, author) stored in chunk metadata
+- Short consecutive pages are merged (below `min_tokens`)
+- Long pages are split at paragraph boundaries (double newlines)
+- `start_line` / `end_line` = page number (1-based)
+- Scanned PDFs (image-only, no text layer) are skipped with a warning
+
+### DOCX Chunking
+
+- Paragraphs grouped by heading style (`Heading 1`, `Heading 2`, etc.)
+- Each heading + its body paragraphs = one chunk (mirrors markdown chunker)
+- Tables extracted as row-by-row text with ` | ` cell separators
+- Document core properties (title, author) stored in chunk metadata
+- `heading_path` metadata preserves the heading hierarchy
+- `start_line` / `end_line` = 1-based section index
+
+### PPTX Chunking
+
+- Text extracted from all shapes: text frames, tables, grouped shapes
+- Speaker notes included (prefixed with `[Speaker notes]`)
+- Title placeholder text stored as `slide_title` metadata
+- Image-only slides (no extractable text) are skipped
+- Short consecutive slides are merged (below `min_tokens`)
+- `start_line` / `end_line` = slide number (1-based)
+
+### Known Limitations
+
+- Scanned PDFs yield empty text (no OCR support)
+- Complex table layouts are flattened to row-by-row text
+- Embedded images, charts, and diagrams are invisible to text extraction
+- Password-protected files cannot be opened (skipped with warning)
+- Formatting (bold, italic, colors, fonts) is stripped — only raw text is indexed
+
+---
+
 ## File Extension → Language Mapping
 
 | Extension | Language | Chunking Strategy |
@@ -206,6 +257,9 @@ Structural/metadata-only elements are skipped:
 | `.md`, `.mdx` | Markdown | Header-based |
 | `.dita` | DITA XML | XML topic-based |
 | `.ditamap` | DITA Map | XML topicref-based |
+| `.pdf` | PDF | Page-based extraction |
+| `.docx` | Word | Heading-based extraction |
+| `.pptx` | PowerPoint | Slide-based extraction |
 | `.txt`, `.rst` | Text | Blank-line fallback |
 
 ---

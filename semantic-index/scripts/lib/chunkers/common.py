@@ -69,6 +69,9 @@ def detect_language(file_path: str) -> Optional[str]:
         ".rst": "rst",
         ".dita": "dita",
         ".ditamap": "ditamap",
+        ".pdf": "pdf",
+        ".docx": "docx",
+        ".pptx": "pptx",
     }
     ext = os.path.splitext(file_path)[1].lower()
     return ext_map.get(ext)
