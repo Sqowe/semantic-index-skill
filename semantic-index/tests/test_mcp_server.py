@@ -9,7 +9,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -430,9 +430,9 @@ class TestToolRegistration:
     """Tests that MCP tools are registered with correct names and annotations."""
 
     def _get_tool_map(self) -> dict:
-        """Build a name → tool dict from the FastMCP server's registered tools."""
-        tools = mcp._tool_manager._tools
-        return {name: tool for name, tool in tools.items()}
+        """Build a name → tool dict via the public FastMCP list_tools() API."""
+        tools = asyncio.run(mcp.list_tools())
+        return {tool.name: tool for tool in tools}
 
     def test_all_three_tools_registered(self):
         """All three tools are registered on the mcp server."""
@@ -542,29 +542,29 @@ class TestPydanticValidation:
 class TestAsyncWrappers:
     """Tests that async tool functions delegate to sync helpers via to_thread."""
 
-    @patch("mcp_server._build_index_sync")
-    def test_build_calls_to_thread(self, mock_sync):
-        """semantic_index_build awaits asyncio.to_thread(_build_index_sync)."""
-        mock_sync.return_value = {"status": "up_to_date"}
+    @patch("mcp_server.asyncio.to_thread")
+    def test_build_delegates_via_to_thread(self, mock_to_thread):
+        """semantic_index_build calls asyncio.to_thread with _build_index_sync."""
+        mock_to_thread.return_value = {"status": "up_to_date"}
         params = BuildIndexInput(project_dir="/tmp/test")
         result = asyncio.run(semantic_index_build(params))
-        mock_sync.assert_called_once_with(params)
+        mock_to_thread.assert_called_once_with(_build_index_sync, params)
         assert result["status"] == "up_to_date"
 
-    @patch("mcp_server._search_index_sync")
-    def test_search_calls_to_thread(self, mock_sync):
-        """semantic_index_search awaits asyncio.to_thread(_search_index_sync)."""
-        mock_sync.return_value = {"query": "test", "total_results": 0, "results": []}
+    @patch("mcp_server.asyncio.to_thread")
+    def test_search_delegates_via_to_thread(self, mock_to_thread):
+        """semantic_index_search calls asyncio.to_thread with _search_index_sync."""
+        mock_to_thread.return_value = {"query": "test", "total_results": 0, "results": []}
         params = SearchIndexInput(project_dir="/tmp/test", query="test")
         result = asyncio.run(semantic_index_search(params))
-        mock_sync.assert_called_once_with(params)
+        mock_to_thread.assert_called_once_with(_search_index_sync, params)
         assert result["total_results"] == 0
 
-    @patch("mcp_server._index_status_sync")
-    def test_status_calls_to_thread(self, mock_sync):
-        """semantic_index_status awaits asyncio.to_thread(_index_status_sync)."""
-        mock_sync.return_value = {"indexed": False}
+    @patch("mcp_server.asyncio.to_thread")
+    def test_status_delegates_via_to_thread(self, mock_to_thread):
+        """semantic_index_status calls asyncio.to_thread with _index_status_sync."""
+        mock_to_thread.return_value = {"indexed": False}
         params = IndexStatusInput(project_dir="/tmp/test")
         result = asyncio.run(semantic_index_status(params))
-        mock_sync.assert_called_once_with(params)
+        mock_to_thread.assert_called_once_with(_index_status_sync, params)
         assert result["indexed"] is False
