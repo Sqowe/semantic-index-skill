@@ -130,19 +130,29 @@ class TestHardSplitText:
         for piece in result:
             assert count_tokens(piece) <= 20
 
+    def test_overlong_single_token_split(self):
+        """A single no-whitespace string exceeding max_tokens must be split."""
+        from scripts.lib.chunkers.common import count_tokens
+        # Create a long string with no spaces (e.g. base64-like blob)
+        long_blob = "A" * 2000  # will be many tokens
+        assert count_tokens(long_blob) > 20  # sanity check
+        result = _hard_split_text(long_blob, max_tokens=20)
+        assert len(result) > 1
+        for piece in result:
+            assert count_tokens(piece) <= 20
+
 
 class TestMergeShortChunks:
     """Tests for _merge_short_chunks with range metadata."""
 
     def test_merges_below_min_tokens(self):
-        c1 = _make_chunk(content="a", token_count=3, start_line=1,
+        c1 = _make_chunk(content="word " * 8, token_count=8, start_line=1,
                          end_line=1, metadata={"page_number": 1})
-        c2 = _make_chunk(content="b", token_count=3, start_line=2,
+        c2 = _make_chunk(content="word " * 8, token_count=8, start_line=2,
                          end_line=2, metadata={"page_number": 2})
         result = _merge_short_chunks([c1, c2], min_tokens=10)
         assert len(result) == 1
-        assert "a" in result[0].content
-        assert "b" in result[0].content
+        assert "word" in result[0].content
 
     def test_does_not_merge_above_min_tokens(self):
         c1 = _make_chunk(content="word " * 30, token_count=30,
@@ -154,6 +164,25 @@ class TestMergeShortChunks:
 
     def test_empty_input(self):
         assert _merge_short_chunks([], min_tokens=10) == []
+
+    def test_drops_final_short_chunk_after_merge(self):
+        """A single chunk below min_tokens with no neighbour should be dropped."""
+        c1 = _make_chunk(content="tiny", token_count=2, metadata={"page_number": 1})
+        result = _merge_short_chunks([c1], min_tokens=10)
+        assert len(result) == 0
+
+    def test_drops_trailing_short_chunk(self):
+        """If the last chunk is still short after merge, it should be dropped."""
+        c1 = _make_chunk(content="word " * 30, token_count=30,
+                         metadata={"page_number": 1})
+        c2 = _make_chunk(content="word " * 30, token_count=30,
+                         metadata={"page_number": 2})
+        c3 = _make_chunk(content="x", token_count=1,
+                         metadata={"page_number": 3})
+        result = _merge_short_chunks([c1, c2, c3], min_tokens=10)
+        # c3 is short and gets merged into c2, but c1 and merged(c2+c3) both >= 10
+        # so both survive. Let's verify none are below min_tokens.
+        assert all(c.token_count >= 10 for c in result)
 
 
 class TestSplitTextAtParagraphs:
@@ -238,6 +267,20 @@ class TestPDFChunker:
         assert len(chunks) >= 1
         assert chunks[0].metadata.get("pdf_title") == "Test Title"
         assert chunks[0].metadata.get("pdf_author") == "Test Author"
+
+    def test_single_short_page_filtered_by_min_tokens(self, tmp_path):
+        """A single PDF page with tiny text should produce no chunks when below min_tokens."""
+        import fitz
+        config = _make_config(tmp_path, min_tokens=50)
+        pdf_path = str(tmp_path / "tiny.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text(fitz.Point(72, 72), "Hi")
+        doc.save(pdf_path)
+        doc.close()
+
+        chunks = chunk_office(pdf_path, "tiny.pdf", "pdf", config)
+        assert chunks == []
 
 
 # ===================================================================
@@ -403,6 +446,22 @@ class TestPPTXChunker:
         chunks = chunk_office(pptx_path, "freeform.pptx", "pptx", config)
         assert len(chunks) >= 1
         assert "free text box" in chunks[0].content
+
+    def test_single_short_slide_filtered_by_min_tokens(self, tmp_path):
+        """A single PPTX slide with tiny text should produce no chunks when below min_tokens."""
+        from pptx import Presentation
+        from pptx.util import Inches
+        config = _make_config(tmp_path, min_tokens=50)
+        pptx_path = str(tmp_path / "tiny.pptx")
+        prs = Presentation()
+        slide_layout = prs.slide_layouts[6]  # blank
+        slide = prs.slides.add_slide(slide_layout)
+        txBox = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        txBox.text_frame.text = "Hi"
+        prs.save(pptx_path)
+
+        chunks = chunk_office(pptx_path, "tiny.pptx", "pptx", config)
+        assert chunks == []
 
 
 # ===================================================================

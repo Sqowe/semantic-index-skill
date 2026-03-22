@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..config import Config
 from ..models import Chunk, ChunkType
-from .common import count_tokens, make_chunk_id
+from .common import count_tokens, get_tokenizer, make_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,11 @@ def _hard_split_text(text: str, max_tokens: int) -> list[str]:
 
 
 def _hard_split_by_words(text: str, max_tokens: int) -> list[str]:
-    """Last-resort splitter: break at word boundaries."""
+    """Last-resort splitter: break at word boundaries.
+
+    Falls back to character-level splitting for single tokens that
+    exceed *max_tokens* (e.g. base64 blobs, long URLs).
+    """
     words = text.split()
     pieces: list[str] = []
     current: list[str] = []
@@ -100,7 +104,25 @@ def _hard_split_by_words(text: str, max_tokens: int) -> list[str]:
         current_tokens += wt
     if current:
         pieces.append(" ".join(current))
-    return pieces
+
+    # Character-level fallback for any piece still over max_tokens
+    final: list[str] = []
+    for piece in pieces:
+        if count_tokens(piece) <= max_tokens:
+            final.append(piece)
+        else:
+            _split_by_chars(piece, max_tokens, final)
+    return final
+
+
+def _split_by_chars(text: str, max_tokens: int, out: list[str]) -> None:
+    """Split *text* into character slices that each fit within *max_tokens*."""
+    tokenizer = get_tokenizer()
+    encoded = tokenizer.encode(text)
+    for i in range(0, len(encoded), max_tokens):
+        segment = tokenizer.decode(encoded[i : i + max_tokens])
+        if segment:
+            out.append(segment)
 
 
 def chunk_office(
@@ -178,6 +200,11 @@ def _merge_short_chunks(
 
     if buffer is not None:
         merged.append(buffer)
+
+    # Drop any chunk still below min_tokens after merging (e.g. single
+    # short page/slide that had no neighbour to merge with).
+    if min_tokens > 0:
+        merged = [c for c in merged if c.token_count >= min_tokens]
 
     return merged
 
