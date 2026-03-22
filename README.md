@@ -628,6 +628,16 @@ Replace `<skill-path>` with the absolute path to your skill installation (e.g., 
 - Blocking operations (chunking, embedding, LanceDB I/O) run via `asyncio.to_thread` to avoid blocking the event loop in HTTP transport mode.
 - The server name is `semantic_index_mcp`, following the Python `{service}_mcp` convention.
 
+### Security: HTTP Transport
+
+When using `--transport http`, be aware that the server exposes index and search operations over the network. By default, FastMCP binds to `127.0.0.1` (localhost only). If you need remote access:
+
+- Do not bind to `0.0.0.0` without authentication in front.
+- Place the server behind a reverse proxy (e.g., nginx, Caddy) that handles TLS and auth.
+- The MCP server has no built-in authentication or encryption — it trusts the transport layer.
+
+For local development and single-user setups, stdio transport (the default) avoids these concerns entirely.
+
 ## Exit Codes
 
 All CLI scripts use consistent exit codes:
