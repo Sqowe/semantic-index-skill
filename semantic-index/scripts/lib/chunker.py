@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .chunkers.common import chunk_text_fallback, detect_language
 from .config import Config
+from .constants import BINARY_FORMATS
 from .models import Chunk
 
 logger = logging.getLogger(__name__)
@@ -23,10 +24,6 @@ TREESITTER_LANGUAGES = {
     "python", "javascript", "typescript",
     "go", "rust", "java", "c", "cpp", "ruby", "php",
 }
-
-
-# Binary formats that require specialized extraction (not UTF-8 text)
-BINARY_FORMATS = {"pdf", "docx", "pptx"}
 
 
 def chunk_file(

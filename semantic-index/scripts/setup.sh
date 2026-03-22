@@ -18,6 +18,8 @@ pip install --upgrade pip -q
 pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
 # Parse arguments: consume known flags, first non-flag arg is config path
+# NOTE: Unknown flags cause exit 1 (strict parsing). If wrapping this
+# script, ensure only supported flags are forwarded.
 INSTALL_HF=false
 INSTALL_OFFICE=false
 CONFIG_PATH=""

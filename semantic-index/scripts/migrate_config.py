@@ -21,6 +21,13 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+# Add scripts/ to sys.path so we can import the canonical constants
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from lib.constants import OFFICE_EXTENSIONS  # noqa: E402
+
 logging.basicConfig(
     stream=sys.stderr,
     level=logging.INFO,
@@ -152,7 +159,7 @@ def analyze_config(config: dict) -> list[dict]:
     # Check for missing office file extensions (Phase 9)
     # Re-read extensions in case DITA migration updated them
     current_exts = file_extensions + missing_dita
-    office_extensions = [".pdf", ".docx", ".pptx"]
+    office_extensions = sorted(OFFICE_EXTENSIONS)
     missing_office = [ext for ext in office_extensions if ext not in current_exts]
     if missing_office:
         migrations.append({
@@ -225,7 +232,18 @@ def apply_migrations(config: dict, migrations: list[dict]) -> dict:
                 if part not in parent:
                     parent[part] = {}
                 parent = parent[part]
-            parent[parts[-1]] = migration["new_value"]
+            value = migration["new_value"]
+            # Deduplicate list values (e.g. file_extensions) to prevent
+            # accumulation across repeated migrations.
+            if isinstance(value, list):
+                seen: set = set()
+                deduped: list = []
+                for item in value:
+                    if item not in seen:
+                        seen.add(item)
+                        deduped.append(item)
+                value = deduped
+            parent[parts[-1]] = value
 
     return updated
 
