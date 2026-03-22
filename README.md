@@ -165,6 +165,7 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | `indexing.file_extensions` | See config | Which file types to index |
 | `indexing.exclude_patterns` | See config | Patterns to skip (in addition to `.gitignore`) |
 | `indexing.max_file_size_kb` | `500` | Skip files larger than this |
+| `indexing.max_office_file_size_kb` | `50000` | Max file size for office documents (PDF/DOCX/PPTX) in KB |
 | `search.default_top_k` | `10` | Default number of search results |
 | `search.default_threshold` | `0.3` | Minimum similarity score (0.0–1.0) |
 | `search.mode` | `"hybrid"` | Search mode: `"vector"`, `"keyword"`, or `"hybrid"` |
@@ -203,6 +204,26 @@ If you add a directory to `exclude_patterns` (or `.indexignore`) after it has al
 3. The indexer removes the corresponding chunks from both the vector store and the BM25 keyword index, then drops the files from the manifest.
 
 After that run, searches will no longer return results from the excluded directory. No `--full` rebuild is needed — incremental indexing handles it.
+
+### Office Document Support
+
+To index PDF, DOCX, and PPTX files, install the optional office dependencies:
+
+```bash
+cd ~/.kiro/skills/semantic-index/scripts
+bash setup.sh --with-office
+```
+
+This installs `PyMuPDF`, `python-docx`, and `python-pptx` into the skill's venv. No additional configuration is needed — office file extensions are included in the default config.
+
+How each format is chunked:
+- PDF: text extracted per page; short consecutive pages are merged, long pages split at paragraph boundaries. Scanned PDFs (image-only) are skipped.
+- DOCX: paragraphs grouped by heading style, mirroring the markdown chunker. Tables are extracted as row-by-row text.
+- PPTX: text extracted from all shapes (text frames, tables, groups). Speaker notes are included. Image-only slides are skipped.
+
+Office files use a separate size limit (`indexing.max_office_file_size_kb`, default 50 MB) since they're typically larger than source code files.
+
+You can combine flags: `bash setup.sh --with-office --with-huggingface`.
 
 ### Local Embedding (HuggingFace Provider)
 
@@ -589,6 +610,16 @@ DITA XML documentation is also supported with XML-aware chunking:
 | DITA | `.dita` | topics (concept, task, reference, glossentry, troubleshooting), prolog metadata, sections |
 | DITA Map | `.ditamap` | navigation hierarchy, topicref structure |
 
+Office documents (PDF, DOCX, PPTX) are supported with format-aware chunking via optional dependencies:
+
+| Format | Extensions | Chunking strategy | Library |
+|--------|-----------|-------------------|---------|
+| PDF | `.pdf` | Page-based splitting | PyMuPDF |
+| Word | `.docx` | Heading-based sectioning | python-docx |
+| PowerPoint | `.pptx` | Slide-based splitting | python-pptx |
+
+Office support requires extra dependencies — see [Office Document Support](#office-document-support) for installation.
+
 Markdown files (`.md`, `.mdx`) use header-based chunking. All other text files matching configured extensions fall back to blank-line splitting.
 
 ## Project Structure
@@ -605,6 +636,7 @@ semantic-index/
     ├── setup.sh                # One-command environment setup
     ├── requirements.txt        # Core Python dependencies
     ├── requirements-huggingface.txt  # Optional: local embedding deps
+    ├── requirements-office.txt       # Optional: PDF/DOCX/PPTX deps
     ├── build_index.py          # CLI: build/rebuild the index
     ├── semantic_search.py      # CLI: search by meaning
     ├── index_status.py         # CLI: index health check
@@ -620,7 +652,8 @@ semantic-index/
         │   ├── common.py       # Shared chunking utilities
         │   ├── code.py         # Tree-sitter AST-aware code chunking
         │   ├── dita.py         # XML-aware DITA documentation chunking
-        │   └── markdown.py     # Header-based markdown chunking
+        │   ├── markdown.py     # Header-based markdown chunking
+        │   └── office.py       # PDF/DOCX/PPTX binary format chunking
         ├── embedder.py         # EmbeddingProvider ABC, factory, cache
         ├── providers/
         │   ├── __init__.py     # Provider registry
@@ -653,6 +686,9 @@ The embedding batch is too large for your hardware. The indexer will auto-recove
 - Try smaller `chunking.max_tokens` (more precise chunks) or larger (more context per chunk)
 - Lower `search.default_threshold` to see more results
 - Check `index_status.py` for stale files — re-index if many files changed
+
+**"No module named 'fitz'" / "No module named 'docx'" / "No module named 'pptx'"**
+Office dependencies aren't installed. Run `bash setup.sh --with-office` in the `scripts/` directory. Office files are silently skipped when deps are missing, so this only appears if you force-import the modules directly.
 
 **Stale index**
 Run `index_status.py` to check. If `stale_files` is high, re-run `build_index.py` to update.
