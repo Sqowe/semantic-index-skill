@@ -22,12 +22,14 @@ pip install -r "$SCRIPT_DIR/requirements.txt" -q
 # script, ensure only supported flags are forwarded.
 INSTALL_HF=false
 INSTALL_OFFICE=false
+INSTALL_MCP=false
 CONFIG_PATH=""
 
 for arg in "$@"; do
     case "$arg" in
         --with-huggingface) INSTALL_HF=true ;;
         --with-office) INSTALL_OFFICE=true ;;
+        --with-mcp) INSTALL_MCP=true ;;
         -*)
             echo "Unknown flag: $arg" >&2
             exit 1
@@ -66,6 +68,12 @@ fi
 if [ "$INSTALL_OFFICE" = true ]; then
     echo "Installing office document extraction dependencies (PDF, DOCX, PPTX)..."
     pip install -r "$SCRIPT_DIR/requirements-office.txt" -q
+fi
+
+# Install MCP server dependencies if requested
+if [ "$INSTALL_MCP" = true ]; then
+    echo "Installing MCP server dependencies..."
+    pip install -r "$SCRIPT_DIR/requirements-mcp.txt" -q
 fi
 
 echo "Setup complete. Dependencies installed."

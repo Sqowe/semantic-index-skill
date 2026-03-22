@@ -1297,11 +1297,23 @@ well-suited for semantic chunking — each topic covers a single subject by desi
 
 **Goal**: Expose the same indexing/search as an MCP server for tools that prefer MCP.
 
-| Step | Task |
-|------|------|
-| 7.1 | Wrap `build_index.py` / `semantic_search.py` / `index_status.py` as MCP tools |
-| 7.2 | Add FastMCP server entry point |
-| 7.3 | Keep the SKILL as the primary interface; MCP is an alternative transport |
+| Step | Task | Status |
+|------|------|--------|
+| 7.1 | Wrap `build_index.py` / `semantic_search.py` / `index_status.py` as MCP tools | ✅ Done |
+| 7.2 | Add FastMCP server entry point (`mcp_server.py`) with stdio transport | ✅ Done |
+| 7.3 | Keep the SKILL as the primary interface; MCP is an alternative transport | ✅ Done |
+
+**Implementation notes:**
+
+- Server name: `semantic_index_mcp` (follows Python `{service}_mcp` convention)
+- Tools: `semantic_index_build`, `semantic_index_search`, `semantic_index_status`
+- All tools use Pydantic `BaseModel` for input validation with `Field()` constraints
+- Tools call library functions directly (no subprocess), reusing `lib/` modules
+- Each tool has proper MCP annotations (`readOnlyHint`, `destructiveHint`, etc.)
+- Transport: stdio by default (local tool, single-user)
+- Dependencies: `mcp[cli]>=1.0.0` in `requirements-mcp.txt`
+- Setup: `bash setup.sh --with-mcp`
+- Run: `python mcp_server.py` (from scripts/ with venv activated)
 
 ### Phase 8: Parallel Indexing Pipeline
 

@@ -567,6 +567,67 @@ A typical conversation might look like:
 
 The AI uses the search results as context to give you a grounded, accurate answer with specific file references.
 
+## MCP Server (Optional)
+
+The same indexing, search, and status functionality is also available as an MCP (Model Context Protocol) server. This is an alternative transport for tools that prefer MCP over CLI scripts. The SKILL remains the primary interface.
+
+### Installation
+
+```bash
+cd ~/.kiro/skills/semantic-index/scripts
+bash setup.sh --with-mcp
+```
+
+This installs `mcp[cli]` into the skill's venv. You can combine flags: `bash setup.sh --with-mcp --with-huggingface --with-office`.
+
+### Running the Server
+
+```bash
+# stdio transport (default — for local MCP clients)
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/mcp_server.py
+
+# Streamable HTTP transport (for remote or multi-client setups)
+$SKILL/scripts/.venv/bin/python $SKILL/scripts/mcp_server.py --transport http
+```
+
+### Exposed Tools
+
+| Tool | Description | Read-only |
+|------|-------------|-----------|
+| `semantic_index_build` | Build or incrementally update the semantic index | No |
+| `semantic_index_search` | Search the index using natural language queries | Yes |
+| `semantic_index_status` | Check index health and statistics | Yes |
+
+All tools accept a `project_dir` parameter (absolute path to the project root) and return structured JSON. Input validation uses Pydantic models with the same constraints as the CLI scripts.
+
+### Kiro Configuration
+
+Add to `.kiro/settings/mcp.json` (workspace level) or `~/.kiro/settings/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "semantic-index": {
+      "command": "<skill-path>/scripts/.venv/bin/python",
+      "args": ["<skill-path>/scripts/mcp_server.py"],
+      "env": {
+        "OPENROUTER_API_KEY": "sk-or-v1-your-key-here"
+      },
+      "disabled": false,
+      "autoApprove": ["semantic_index_search", "semantic_index_status"]
+    }
+  }
+}
+```
+
+Replace `<skill-path>` with the absolute path to your skill installation (e.g., `/Users/you/.kiro/skills/semantic-index`).
+
+### Notes
+
+- The MCP server calls library functions directly (no subprocess spawning), so performance is identical to the CLI scripts.
+- Blocking operations (chunking, embedding, LanceDB I/O) run via `asyncio.to_thread` to avoid blocking the event loop in HTTP transport mode.
+- The server name is `semantic_index_mcp`, following the Python `{service}_mcp` convention.
+
 ## Exit Codes
 
 All CLI scripts use consistent exit codes:
@@ -637,10 +698,12 @@ semantic-index/
     ├── requirements.txt        # Core Python dependencies
     ├── requirements-huggingface.txt  # Optional: local embedding deps
     ├── requirements-office.txt       # Optional: PDF/DOCX/PPTX deps
+    ├── requirements-mcp.txt          # Optional: MCP server deps
     ├── build_index.py          # CLI: build/rebuild the index
     ├── semantic_search.py      # CLI: search by meaning
     ├── index_status.py         # CLI: index health check
     ├── migrate_config.py       # CLI: migrate config to latest schema
+    ├── mcp_server.py           # MCP server: optional alternative transport
     └── lib/
         ├── __init__.py
         ├── models.py           # Data classes and exceptions
