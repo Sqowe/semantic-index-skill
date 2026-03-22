@@ -19,6 +19,10 @@ from ..models import Chunk, ChunkType
 
 logger = logging.getLogger(__name__)
 
+# Re-export from the lightweight constants module so existing chunker
+# code that imports from common.py keeps working.
+from ..constants import BINARY_FORMATS, OFFICE_EXTENSIONS  # noqa: E402,F401
+
 # Lazy-loaded tokenizer
 _tokenizer: Optional[tiktoken.Encoding] = None
 

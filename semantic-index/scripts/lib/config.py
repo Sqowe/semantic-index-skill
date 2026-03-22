@@ -55,6 +55,7 @@ class IndexingConfig:
         ".rb", ".php",
         ".md", ".mdx", ".txt", ".rst",
         ".dita", ".ditamap",
+        ".pdf", ".docx", ".pptx",
     ])
     exclude_patterns: list[str] = field(default_factory=lambda: [
         "node_modules/", "venv/", ".venv/", "__pycache__/",
