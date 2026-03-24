@@ -93,6 +93,34 @@ If no `.index/config.json` exists yet, the scripts create one on first run.
 The provider choice is purely a configuration concern — indexing and search
 commands work identically regardless of provider.
 
+## Path Resolution
+
+Before running any command, resolve these two placeholders:
+
+- `<skill-path>`: Always `~/.kiro/skills/semantic-index`. This is fixed.
+- `<project-root>`: The actual workspace root directory. **Always run `pwd`
+  first** to get the real path. Never guess from environment variables,
+  Machine ID context, or other indirect sources — these can point to
+  non-existent or inaccessible paths.
+
+**Common mistake**: Using a path like `/Users/<username>/Documents/workspace`
+derived from IDE context variables instead of the actual working directory.
+This causes `PermissionError` or "No .index/ directory found" even when the
+index exists, because the script tries to create directories under a path
+it cannot access.
+
+**Correct pattern**:
+```bash
+# Step 1: Get the real workspace path
+pwd
+# Output: /Users/johndoe/src/my-project
+
+# Step 2: Use that exact path in all commands
+~/.kiro/skills/semantic-index/scripts/.venv/bin/python \
+  ~/.kiro/skills/semantic-index/scripts/index_status.py \
+  --project-dir /Users/johndoe/src/my-project
+```
+
 ## Core Commands
 
 All commands output structured JSON to stdout. Progress and logs go to stderr.
@@ -267,6 +295,13 @@ Environment variable overrides:
 
 ## Troubleshooting
 
+- **PermissionError or "No such file or directory"**: The `--project-dir`
+  path is wrong. Run `pwd` to get the actual workspace root and use that
+  exact path. Do not guess paths from IDE context, Machine ID, or
+  environment variables — they often point to non-existent locations.
+- **"No .index/ directory found" when index exists**: Same cause — the
+  `--project-dir` is pointing to a different directory than where `.index/`
+  lives. Verify with `ls <project-root>/.index/` before running commands.
 - **"No index found"**: Run `build_index.py` first to create the `.index/` directory
 - **"No API key found"**: Either set `OPENROUTER_API_KEY` env var / add to config, or switch to `"huggingface"` provider in `.index/config.json` for local embedding with no API key
 - **Slow indexing**: Large projects (>1000 files) take time on first run; subsequent runs are incremental
