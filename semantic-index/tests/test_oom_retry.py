@@ -81,6 +81,7 @@ class TestProviderInternalHalving:
         provider._doc_prefix = config.embedding.document_prefix
         provider._query_prefix = config.embedding.query_prefix
         provider._dimensions = config.embedding.dimensions
+        provider._max_embed_chars = config.embedding.max_embed_chars
         return provider
 
     def test_oom_succeeds_after_internal_halving(self) -> None:

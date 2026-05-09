@@ -6,6 +6,7 @@ Covers:
 - Non-dict JSON payload (list, string) raises EmbeddingError
 """
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -352,3 +353,192 @@ class TestContextLengthDetection:
         provider = _make_provider()
         with pytest.raises(EmbeddingError, match="no 'data' field"):
             provider.embed_texts(["test"])
+
+
+
+# ---------------------------------------------------------------------------
+# max_embed_chars truncation tests (OpenRouter)
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterTruncation:
+    """Tests for max_embed_chars truncation in OpenRouterProvider."""
+
+    def _make_provider_with_limit(self, max_chars: int):
+        """Create an OpenRouterProvider with a specific max_embed_chars."""
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="openrouter",
+            api_key="test-key",
+            max_retries=1,
+            retry_delay_seconds=0.01,
+            max_embed_chars=max_chars,
+            document_prefix="doc: ",
+            query_prefix="query: ",
+        )
+        from lib.providers.openrouter import OpenRouterProvider
+
+        return OpenRouterProvider(config)
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_text_under_limit_not_truncated(self, mock_post):
+        """Text under max_embed_chars is sent as-is (with prefix)."""
+        mock_post.return_value = _mock_response(
+            200, {"data": [{"index": 0, "embedding": [0.1]}]}
+        )
+        provider = self._make_provider_with_limit(100)
+        provider.embed_texts(["short"])
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert sent_body["input"] == ["doc: short"]
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_text_at_exact_limit_not_truncated(self, mock_post):
+        """Text exactly at max_embed_chars boundary is not truncated."""
+        mock_post.return_value = _mock_response(
+            200, {"data": [{"index": 0, "embedding": [0.1]}]}
+        )
+        # prefix "doc: " is 5 chars, so text of 95 chars = 100 total
+        text = "x" * 95
+        provider = self._make_provider_with_limit(100)
+        provider.embed_texts([text])
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert sent_body["input"] == [f"doc: {text}"]
+        assert len(sent_body["input"][0]) == 100
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_text_over_limit_truncated(self, mock_post):
+        """Text exceeding max_embed_chars is truncated to the limit."""
+        mock_post.return_value = _mock_response(
+            200, {"data": [{"index": 0, "embedding": [0.1]}]}
+        )
+        # prefix "doc: " is 5 chars, text of 100 chars = 105 total > 100 limit
+        text = "x" * 100
+        provider = self._make_provider_with_limit(100)
+        provider.embed_texts([text])
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert len(sent_body["input"][0]) == 100  # truncated to limit
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_prefix_included_in_truncation_length(self, mock_post):
+        """Truncation limit includes the prefix length."""
+        mock_post.return_value = _mock_response(
+            200, {"data": [{"index": 0, "embedding": [0.1]}]}
+        )
+        # prefix "doc: " = 5 chars, limit = 10, so only 10 chars total
+        text = "abcdefghij"  # 10 chars + 5 prefix = 15 > 10
+        provider = self._make_provider_with_limit(10)
+        provider.embed_texts([text])
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert sent_body["input"][0] == "doc: abcde"  # 10 chars total
+        assert len(sent_body["input"][0]) == 10
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_query_over_limit_truncated(self, mock_post):
+        """Query exceeding max_embed_chars is truncated."""
+        mock_post.return_value = _mock_response(
+            200, {"data": [{"index": 0, "embedding": [0.1]}]}
+        )
+        query = "y" * 100  # + "query: " prefix = 107 > 100
+        provider = self._make_provider_with_limit(100)
+        provider.embed_query(query)
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert len(sent_body["input"][0]) == 100
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_batch_partial_truncation(self, mock_post):
+        """Only texts over the limit are truncated; others are untouched."""
+        mock_post.return_value = _mock_response(
+            200,
+            {
+                "data": [
+                    {"index": 0, "embedding": [0.1]},
+                    {"index": 1, "embedding": [0.2]},
+                ]
+            },
+        )
+        short_text = "hi"  # "doc: hi" = 5 chars < 20
+        long_text = "z" * 50  # "doc: " + 50 = 55 > 20
+        provider = self._make_provider_with_limit(20)
+        provider.embed_texts([short_text, long_text])
+
+        sent_body = mock_post.call_args[1]["json"]
+        assert sent_body["input"][0] == "doc: hi"  # not truncated
+        assert len(sent_body["input"][1]) == 20  # truncated
+
+
+# ---------------------------------------------------------------------------
+# max_embed_chars config validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestMaxEmbedCharsValidation:
+    """Tests for max_embed_chars config validation."""
+
+    def test_zero_raises_config_error(self, tmp_path):
+        """max_embed_chars=0 raises ConfigError."""
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {
+            "schema_version": "1.0",
+            "embedding": {"max_embed_chars": 0},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        from lib.config import load_config
+
+        with pytest.raises(CfgErr, match="max_embed_chars"):
+            load_config(str(tmp_path))
+
+    def test_negative_raises_config_error(self, tmp_path):
+        """max_embed_chars=-1 raises ConfigError."""
+        from lib.models import ConfigError as CfgErr
+
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {
+            "schema_version": "1.0",
+            "embedding": {"max_embed_chars": -100},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        from lib.config import load_config
+
+        with pytest.raises(CfgErr, match="max_embed_chars"):
+            load_config(str(tmp_path))
+
+    def test_positive_value_passes(self, tmp_path):
+        """max_embed_chars=1000 passes validation."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {
+            "schema_version": "1.0",
+            "embedding": {"max_embed_chars": 1000},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        from lib.config import load_config
+
+        config = load_config(str(tmp_path))
+        assert config.embedding.max_embed_chars == 1000
+
+    def test_missing_uses_default(self, tmp_path):
+        """Missing max_embed_chars falls back to default 30000."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+        cfg_data = {
+            "schema_version": "1.0",
+            "embedding": {"provider": "openrouter"},
+        }
+        (index_dir / "config.json").write_text(json.dumps(cfg_data))
+
+        from lib.config import load_config
+
+        config = load_config(str(tmp_path))
+        assert config.embedding.max_embed_chars == 30000

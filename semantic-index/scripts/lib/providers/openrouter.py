@@ -40,6 +40,7 @@ class OpenRouterProvider:
         self._query_prefix = config.embedding.query_prefix
         self._max_retries = config.embedding.max_retries
         self._retry_delay = config.embedding.retry_delay_seconds
+        self._max_embed_chars = config.embedding.max_embed_chars
 
         if not self._api_key:
             raise EmbeddingError(
@@ -238,6 +239,7 @@ class OpenRouterProvider:
         """Embed a batch of document texts.
 
         Adds the document prefix before sending to the API.
+        Truncates texts exceeding max_embed_chars to prevent API errors.
 
         Args:
             texts: Raw text strings to embed.
@@ -245,13 +247,28 @@ class OpenRouterProvider:
         Returns:
             List of embedding vectors.
         """
-        prefixed = [self._doc_prefix + t for t in texts]
+        prefixed = []
+        truncated_count = 0
+        for t in texts:
+            full = self._doc_prefix + t
+            if len(full) > self._max_embed_chars:
+                truncated_count += 1
+                full = full[: self._max_embed_chars]
+            prefixed.append(full)
+        if truncated_count:
+            logger.warning(
+                "Truncated %d/%d texts to %d chars for embedding",
+                truncated_count,
+                len(texts),
+                self._max_embed_chars,
+            )
         return self._call_api(prefixed)
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single search query.
 
         Adds the query prefix before sending to the API.
+        Truncates if exceeding max_embed_chars.
 
         Args:
             query: Natural language search query.
@@ -260,6 +277,13 @@ class OpenRouterProvider:
             Single embedding vector.
         """
         prefixed = self._query_prefix + query
+        if len(prefixed) > self._max_embed_chars:
+            logger.warning(
+                "Truncating query from %d to %d chars for embedding",
+                len(prefixed),
+                self._max_embed_chars,
+            )
+            prefixed = prefixed[: self._max_embed_chars]
         vectors = self._call_api([prefixed])
         return vectors[0]
 

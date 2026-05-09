@@ -32,6 +32,7 @@ class EmbeddingConfig:
     document_prefix: str = ""
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
+    max_embed_chars: int = 30000  # Pre-truncate texts exceeding this character limit
     device: Optional[str] = None  # None=auto, "cpu", "cuda", "mps"
     trust_remote_code: bool = False  # Allow model repos to run arbitrary code
 
@@ -210,6 +211,12 @@ def _validate_config(config: Config) -> None:
         raise ConfigError(
             f"Invalid embedding.retry_delay_seconds: {config.embedding.retry_delay_seconds}. "
             "Must be >= 0."
+        )
+
+    if config.embedding.max_embed_chars < 1:
+        raise ConfigError(
+            f"Invalid embedding.max_embed_chars: {config.embedding.max_embed_chars}. "
+            "Must be >= 1."
         )
 
     # Numeric range validation for search settings
