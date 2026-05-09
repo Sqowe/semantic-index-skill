@@ -81,18 +81,24 @@ class OpenRouterProvider:
                     timeout=60,
                 )
 
-                # Handle context length exceeded (400) — raise as
+                # Handle context/input length exceeded (400/422) — raise as
                 # RuntimeError so the batch-splitting logic in Embedder
                 # can catch it and retry with smaller batches.
-                if resp.status_code == 400:
+                if resp.status_code in (400, 422):
                     try:
                         err_body = resp.json()
                     except Exception:
                         err_body = resp.text[:500]
                     err_str = str(err_body).lower()
-                    if "context length" in err_str or "too many tokens" in err_str:
+                    is_length_error = (
+                        "context length" in err_str
+                        or "too many tokens" in err_str
+                        or "input sequence" in err_str
+                        or "input length" in err_str
+                    )
+                    if is_length_error:
                         logger.warning(
-                            "Context length exceeded for batch of %d texts, "
+                            "Input length exceeded for batch of %d texts, "
                             "signaling for batch split: %s",
                             len(texts),
                             str(err_body)[:300],
@@ -148,6 +154,27 @@ class OpenRouterProvider:
                     error_msg = data.get("error", {})
                     # Sanitize: log only error code/message, truncated
                     sanitized = str(error_msg)[:500]
+
+                    # Check if this is a context/input length error
+                    # wrapped in a 200 response (OpenRouter proxying upstream errors)
+                    sanitized_lower = sanitized.lower()
+                    is_length_error = (
+                        "context length" in sanitized_lower
+                        or "too many tokens" in sanitized_lower
+                        or "input sequence" in sanitized_lower
+                        or "input length" in sanitized_lower
+                    )
+                    if is_length_error:
+                        logger.warning(
+                            "Input length exceeded for batch of %d texts "
+                            "(wrapped in 200 response), signaling for batch split: %s",
+                            len(texts),
+                            sanitized[:300],
+                        )
+                        raise RuntimeError(
+                            f"context length exceeded: {sanitized[:300]}"
+                        )
+
                     logger.error(
                         "Unexpected API response (no 'data' field). "
                         "Error payload: %s",
