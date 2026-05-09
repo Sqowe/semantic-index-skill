@@ -240,6 +240,8 @@ class OpenRouterProvider:
 
         Adds the document prefix before sending to the API.
         Truncates texts exceeding max_embed_chars to prevent API errors.
+        If a single text still exceeds the model's token limit after
+        truncation, progressively reduces it by 25% until it fits.
 
         Args:
             texts: Raw text strings to embed.
@@ -262,7 +264,60 @@ class OpenRouterProvider:
                 len(texts),
                 self._max_embed_chars,
             )
-        return self._call_api(prefixed)
+
+        try:
+            return self._call_api(prefixed)
+        except RuntimeError as exc:
+            # Only retry truncation for context-length errors
+            if "context length" not in str(exc).lower():
+                raise
+            # If batch has multiple texts, re-raise for batch splitting
+            if len(prefixed) > 1:
+                raise
+            # Single text still too long — progressively truncate
+            return self._progressive_truncate(prefixed[0])
+        except EmbeddingError as exc:
+            # Catch context-length errors that came through a different path
+            exc_str = str(exc).lower()
+            if "context length" not in exc_str and "input length" not in exc_str:
+                raise
+            if len(prefixed) > 1:
+                # Re-raise as RuntimeError for batch splitting
+                raise RuntimeError(f"context length exceeded: {exc}") from exc
+            return self._progressive_truncate(prefixed[0])
+
+    def _progressive_truncate(self, text: str) -> list[list[float]]:
+        """Progressively reduce text length by 25% until it fits the model.
+
+        Args:
+            text: The prefixed text that exceeded the token limit.
+
+        Returns:
+            List containing a single embedding vector.
+
+        Raises:
+            RuntimeError: If text cannot be embedded even at 100 chars.
+        """
+        limit = len(text)
+        while limit > 100:
+            limit = limit * 3 // 4  # reduce by 25% each iteration
+            logger.warning(
+                "Single text still exceeds token limit, "
+                "retrying with %d chars (was %d)",
+                limit,
+                len(text),
+            )
+            try:
+                return self._call_api([text[:limit]])
+            except (RuntimeError, EmbeddingError) as retry_exc:
+                exc_str = str(retry_exc).lower()
+                if "context length" not in exc_str and "input length" not in exc_str:
+                    raise
+                continue
+        # If we get here, even 100 chars fails — give up
+        raise RuntimeError(
+            f"context length exceeded: text cannot be embedded even at 100 chars"
+        )
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single search query.

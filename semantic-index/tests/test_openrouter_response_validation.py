@@ -542,3 +542,236 @@ class TestMaxEmbedCharsValidation:
 
         config = load_config(str(tmp_path))
         assert config.embedding.max_embed_chars == 20000
+
+
+
+# ---------------------------------------------------------------------------
+# Progressive truncation retry tests (OpenRouter)
+# ---------------------------------------------------------------------------
+
+
+class TestProgressiveTruncation:
+    """Tests for progressive truncation on single-text token limit errors."""
+
+    def _make_provider_with_limit(self, max_chars: int):
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="openrouter",
+            api_key="test-key",
+            max_retries=1,
+            retry_delay_seconds=0.01,
+            max_embed_chars=max_chars,
+        )
+        from lib.providers.openrouter import OpenRouterProvider
+
+        return OpenRouterProvider(config)
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_progressive_truncation_succeeds(self, mock_post):
+        """Single text that fails at full length succeeds after truncation."""
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            body = kwargs.get("json", {})
+            text_len = len(body["input"][0]) if body.get("input") else 0
+            # Fail if text > 500 chars, succeed otherwise
+            if text_len > 500:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = {
+                    "error": {"message": "maximum context length is 8192 tokens", "code": 400}
+                }
+                return resp
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+            return resp
+
+        mock_post.side_effect = side_effect
+        provider = self._make_provider_with_limit(1000)
+        result = provider.embed_texts(["x" * 1000])
+
+        assert result == [[0.1, 0.2]]
+        assert call_count[0] > 1  # Had to retry
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_non_length_error_not_retried(self, mock_post):
+        """Non-context-length RuntimeError is raised immediately, no truncation."""
+        # Return a non-length error wrapped in 200
+        mock_post.return_value = _mock_response(
+            200,
+            {"error": {"message": "Model not available", "code": 503}},
+        )
+
+        provider = self._make_provider_with_limit(1000)
+        with pytest.raises(EmbeddingError, match="no 'data' field"):
+            provider.embed_texts(["x" * 500])
+
+        # Should only be called once — no retries
+        assert mock_post.call_count == 1
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_multi_text_length_error_reraises_for_splitting(self, mock_post):
+        """Multi-text batch with length error re-raises for batch splitting."""
+        mock_post.return_value = _mock_response(
+            200,
+            {"error": {"message": "maximum context length exceeded", "code": 400}},
+        )
+
+        provider = self._make_provider_with_limit(1000)
+        with pytest.raises(RuntimeError, match="context length"):
+            provider.embed_texts(["text1", "text2"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_non_length_runtime_error_during_retry_raises(self, mock_post):
+        """If a non-length error occurs during truncation retry, it raises."""
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            if call_count[0] == 1:
+                # First call: context length error
+                resp.json.return_value = {
+                    "error": {"message": "maximum context length is 8192", "code": 400}
+                }
+            else:
+                # Retry: different error (not length-related)
+                resp.json.return_value = {
+                    "error": {"message": "Service unavailable", "code": 503}
+                }
+            return resp
+
+        mock_post.side_effect = side_effect
+        provider = self._make_provider_with_limit(1000)
+
+        # Should raise EmbeddingError (from the non-length error on retry)
+        with pytest.raises(EmbeddingError, match="no 'data' field"):
+            provider.embed_texts(["x" * 500])
+
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_http_400_context_length_triggers_progressive_truncation(self, mock_post):
+        """Direct HTTP 400 context-length error triggers progressive truncation."""
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            body = kwargs.get("json", {})
+            text_len = len(body["input"][0]) if body.get("input") else 0
+            resp = MagicMock()
+            resp.headers = {}
+            if text_len > 500:
+                # Return 400 context-length error
+                resp.status_code = 400
+                resp.json.return_value = {
+                    "error": {
+                        "message": "This model's maximum context length is 8192 tokens.",
+                        "code": 400,
+                    }
+                }
+            else:
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = {"data": [{"index": 0, "embedding": [0.5]}]}
+            return resp
+
+        mock_post.side_effect = side_effect
+        provider = self._make_provider_with_limit(1000)
+        result = provider.embed_texts(["y" * 1000])
+
+        assert result == [[0.5]]
+        assert call_count[0] > 1
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace progressive truncation tests
+# ---------------------------------------------------------------------------
+
+
+class TestHuggingFaceProgressiveTruncation:
+    """Tests for HuggingFace provider progressive truncation on OOM."""
+
+    def _make_provider(self, max_chars: int = 1000):
+        """Build a HuggingFaceProvider with mocked model."""
+        from lib.providers.huggingface import HuggingFaceProvider
+
+        config = Config()
+        config.embedding = EmbeddingConfig(
+            provider="huggingface",
+            model="test-model",
+            dimensions=3,
+            batch_size=1,
+            max_embed_chars=max_chars,
+            trust_remote_code=False,
+        )
+
+        mock_model = MagicMock()
+        mock_model.get_sentence_embedding_dimension.return_value = 3
+        mock_model.device = "cpu"
+
+        with patch.dict("sys.modules", {"sentence_transformers": MagicMock()}):
+            with patch.object(HuggingFaceProvider, "__init__", lambda self, cfg: None):
+                provider = HuggingFaceProvider.__new__(HuggingFaceProvider)
+
+        provider._model = mock_model
+        provider._batch_size = config.embedding.batch_size
+        provider._doc_prefix = config.embedding.document_prefix
+        provider._query_prefix = config.embedding.query_prefix
+        provider._dimensions = config.embedding.dimensions
+        provider._max_embed_chars = config.embedding.max_embed_chars
+        return provider
+
+    def test_single_text_oom_succeeds_after_truncation(self):
+        """Single text OOM succeeds after progressive truncation."""
+        import numpy as np
+
+        provider = self._make_provider(max_chars=1000)
+        call_count = [0]
+
+        def mock_encode(texts, batch_size=32, **kwargs):
+            call_count[0] += 1
+            text_len = len(texts[0])
+            if text_len > 500:
+                raise RuntimeError("Invalid buffer size: 16.03 GiB")
+            return np.array([[0.1, 0.2, 0.3]])
+
+        provider._model.encode = mock_encode
+        result = provider.embed_texts(["x" * 1000])
+
+        assert result == [[0.1, 0.2, 0.3]]
+        assert call_count[0] > 1
+
+    def test_non_oom_error_during_retry_raises(self):
+        """Non-OOM RuntimeError during truncation retry raises immediately."""
+        provider = self._make_provider(max_chars=1000)
+        call_count = [0]
+
+        def mock_encode(texts, batch_size=32, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("Invalid buffer size: 16.03 GiB")
+            # Second call: non-OOM error
+            raise RuntimeError("CUDA device not available")
+
+        provider._model.encode = mock_encode
+
+        with pytest.raises(RuntimeError, match="CUDA device not available"):
+            provider.embed_texts(["x" * 1000])
+
+    def test_truncation_exhaustion_reraises(self):
+        """If truncation reaches minimum and still OOMs, re-raises."""
+        provider = self._make_provider(max_chars=200)
+
+        def mock_encode(texts, batch_size=32, **kwargs):
+            raise RuntimeError("Invalid buffer size: 16.03 GiB")
+
+        provider._model.encode = mock_encode
+
+        with pytest.raises(RuntimeError, match="Invalid buffer size"):
+            provider.embed_texts(["x" * 200])

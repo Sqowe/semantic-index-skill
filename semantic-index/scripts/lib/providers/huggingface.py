@@ -134,6 +134,30 @@ class HuggingFaceProvider:
                     raise
                 new_batch_size = max(1, batch_size // 2)
                 if new_batch_size == batch_size:
+                    # Single text OOM — try progressive truncation
+                    if len(prefixed) == 1:
+                        text = prefixed[0]
+                        limit = len(text)
+                        while limit > 100:
+                            limit = limit * 3 // 4
+                            logger.warning(
+                                "Single text OOM, retrying with %d chars (was %d)",
+                                limit,
+                                len(text),
+                            )
+                            try:
+                                embeddings = self._model.encode(
+                                    [text[:limit]],
+                                    batch_size=1,
+                                    show_progress_bar=False,
+                                    convert_to_numpy=True,
+                                )
+                                return embeddings.tolist()
+                            except RuntimeError as retry_exc:
+                                retry_msg = str(retry_exc).lower()
+                                if "invalid buffer size" not in retry_msg and "out of memory" not in retry_msg:
+                                    raise
+                                continue
                     # Re-raise the original RuntimeError so the caller
                     # (Embedder) can split the chunk batch to isolate
                     # the pathological chunk(s).
