@@ -281,18 +281,22 @@ class Embedder:
                 vectors = self._provider.embed_texts(texts)
             except RuntimeError as exc:
                 err_msg = str(exc).lower()
-                if "invalid buffer size" not in err_msg and "out of memory" not in err_msg:
+                is_oom = "invalid buffer size" in err_msg or "out of memory" in err_msg
+                is_context_length = "context length" in err_msg
+                if not is_oom and not is_context_length:
                     raise
                 if len(batch) <= 1:
                     raise EmbeddingError(
-                        f"OOM embedding a single chunk ({len(texts[0])} chars). "
-                        f"Reduce chunking.max_tokens or use a smaller model. "
+                        f"Cannot embed single chunk ({len(texts[0])} chars): "
+                        f"exceeds model limits. Reduce chunking.max_tokens "
+                        f"or use a model with a larger context window. "
                         f"Original error: {exc}"
                     ) from exc
                 mid = len(batch) // 2
+                reason = "OOM" if is_oom else "context length exceeded"
                 logger.warning(
-                    "OOM on batch of %d chunks, splitting into %d + %d and retrying: %s",
-                    len(batch), mid, len(batch) - mid, exc,
+                    "%s on batch of %d chunks, splitting into %d + %d and retrying: %s",
+                    reason, len(batch), mid, len(batch) - mid, exc,
                 )
                 # Push the two halves back to the front of the queue
                 pending_batches.appendleft(batch[mid:])

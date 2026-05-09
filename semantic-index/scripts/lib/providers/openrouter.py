@@ -81,6 +81,26 @@ class OpenRouterProvider:
                     timeout=60,
                 )
 
+                # Handle context length exceeded (400) — raise as
+                # RuntimeError so the batch-splitting logic in Embedder
+                # can catch it and retry with smaller batches.
+                if resp.status_code == 400:
+                    try:
+                        err_body = resp.json()
+                    except Exception:
+                        err_body = resp.text[:500]
+                    err_str = str(err_body).lower()
+                    if "context length" in err_str or "too many tokens" in err_str:
+                        logger.warning(
+                            "Context length exceeded for batch of %d texts, "
+                            "signaling for batch split: %s",
+                            len(texts),
+                            str(err_body)[:300],
+                        )
+                        raise RuntimeError(
+                            f"context length exceeded: {str(err_body)[:300]}"
+                        )
+
                 # Handle rate limiting
                 if resp.status_code == 429:
                     fallback_delay = self._retry_delay * (2 ** attempt)
