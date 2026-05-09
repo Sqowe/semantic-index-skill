@@ -53,7 +53,7 @@ SEARCH_DEFAULTS = {
 EMBEDDING_DEFAULTS = {
     "device": None,
     "trust_remote_code": False,
-    "max_embed_chars": 30000,
+    "max_embed_chars": 24000,
 }
 
 # Fields that should be removed (deprecated or moved to future phases)

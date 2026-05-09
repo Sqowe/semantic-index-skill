@@ -541,4 +541,4 @@ class TestMaxEmbedCharsValidation:
         from lib.config import load_config
 
         config = load_config(str(tmp_path))
-        assert config.embedding.max_embed_chars == 30000
+        assert config.embedding.max_embed_chars == 24000
