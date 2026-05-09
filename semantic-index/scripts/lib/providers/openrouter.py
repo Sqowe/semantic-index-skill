@@ -106,6 +106,37 @@ class OpenRouterProvider:
                 resp.raise_for_status()
                 data = resp.json()
 
+                # Type guard: ensure response is a dict
+                if not isinstance(data, dict):
+                    snippet = str(data)[:200]
+                    logger.error(
+                        "API returned non-dict response (type=%s): %s",
+                        type(data).__name__,
+                        snippet,
+                    )
+                    raise EmbeddingError(
+                        f"Unexpected API response type "
+                        f"({type(data).__name__}): {snippet}"
+                    )
+
+                # Log response keys for debugging
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("API response keys: %s", list(data.keys()))
+
+                # Validate response structure
+                if "data" not in data:
+                    error_msg = data.get("error", {})
+                    # Sanitize: log only error code/message, truncated
+                    sanitized = str(error_msg)[:500]
+                    logger.error(
+                        "Unexpected API response (no 'data' field). "
+                        "Error payload: %s",
+                        sanitized,
+                    )
+                    raise EmbeddingError(
+                        f"Unexpected API response (no 'data' field): {sanitized}"
+                    )
+
                 # Sort by index to ensure correct ordering
                 embeddings = sorted(data["data"], key=lambda x: x["index"])
                 return [item["embedding"] for item in embeddings]
