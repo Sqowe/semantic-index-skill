@@ -81,9 +81,27 @@ class OpenRouterProvider:
                     timeout=60,
                 )
 
-                # Handle context/input length exceeded (400/422) — raise as
+                # Handle context/input length exceeded (400/413/422) — raise as
                 # RuntimeError so the batch-splitting logic in Embedder
                 # can catch it and retry with smaller batches.
+                #
+                # 413 is always a payload size issue — trigger split unconditionally.
+                if resp.status_code == 413:
+                    try:
+                        err_body = resp.json()
+                    except Exception:
+                        err_body = resp.text[:300] or "Payload Too Large"
+                    logger.warning(
+                        "Payload too large for batch of %d texts "
+                        "(HTTP 413), signaling for batch split: %s",
+                        len(texts),
+                        str(err_body)[:300],
+                    )
+                    raise RuntimeError(
+                        f"context length exceeded: HTTP 413 - {str(err_body)[:300]}"
+                    )
+
+                # 400/422 may be length errors — check message keywords.
                 if resp.status_code in (400, 422):
                     try:
                         err_body = resp.json()
@@ -95,12 +113,16 @@ class OpenRouterProvider:
                         or "too many tokens" in err_str
                         or "input sequence" in err_str
                         or "input length" in err_str
+                        or "maximum context" in err_str
+                        or "token limit" in err_str
+                        or "payload too large" in err_str
                     )
                     if is_length_error:
                         logger.warning(
-                            "Input length exceeded for batch of %d texts, "
-                            "signaling for batch split: %s",
+                            "Input length exceeded for batch of %d texts "
+                            "(HTTP %d), signaling for batch split: %s",
                             len(texts),
+                            resp.status_code,
                             str(err_body)[:300],
                         )
                         raise RuntimeError(
@@ -152,8 +174,14 @@ class OpenRouterProvider:
                 # Validate response structure
                 if "data" not in data:
                     error_msg = data.get("error", {})
-                    # Sanitize: log only error code/message, truncated
-                    sanitized = str(error_msg)[:500]
+                    # Flatten nested error messages for detection.
+                    # OpenRouter wraps upstream errors as:
+                    #   {"error": {"message": "HTTP 4xx: {...}", "code": N}}
+                    # or {"error": "string message"}
+                    if isinstance(error_msg, dict):
+                        sanitized = str(error_msg.get("message", error_msg))[:500]
+                    else:
+                        sanitized = str(error_msg)[:500]
 
                     # Check if this is a context/input length error
                     # wrapped in a 200 response (OpenRouter proxying upstream errors)
@@ -163,6 +191,10 @@ class OpenRouterProvider:
                         or "too many tokens" in sanitized_lower
                         or "input sequence" in sanitized_lower
                         or "input length" in sanitized_lower
+                        or "maximum context" in sanitized_lower
+                        or "token limit" in sanitized_lower
+                        or "payload too large" in sanitized_lower
+                        or "request entity too large" in sanitized_lower
                     )
                     if is_length_error:
                         logger.warning(

@@ -185,3 +185,170 @@ class TestNonDictResponse:
         provider = _make_provider()
         with pytest.raises(EmbeddingError, match="list"):
             provider.embed_texts(["test"])
+
+
+
+# ---------------------------------------------------------------------------
+# Context length error detection (triggers batch splitting)
+# ---------------------------------------------------------------------------
+
+
+class TestContextLengthDetection:
+    """Tests for context/input length errors that trigger batch splitting."""
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_400_context_length_raises_runtime_error(self, mock_post):
+        """HTTP 400 with 'context length' triggers RuntimeError for splitting."""
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.json.return_value = {
+            "error": {
+                "message": "This model's maximum context length is 8192 tokens.",
+                "code": 400,
+            }
+        }
+        resp.headers = {}
+        mock_post.return_value = resp
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_422_input_sequence_raises_runtime_error(self, mock_post):
+        """HTTP 422 with 'input sequence' triggers RuntimeError for splitting."""
+        resp = MagicMock()
+        resp.status_code = 422
+        resp.json.return_value = {
+            "detail": [{
+                "msg": "Value error, The input sequence should have less than 131072 characters.",
+            }]
+        }
+        resp.headers = {}
+        mock_post.return_value = resp
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_200_wrapped_context_length_raises_runtime_error(self, mock_post):
+        """HTTP 200 wrapping a context length error triggers RuntimeError."""
+        mock_post.return_value = _mock_response(
+            200,
+            {
+                "error": {
+                    "message": "HTTP 400: {\"error\":{\"message\":\"This model's "
+                    "maximum context length is 8192 tokens.\",\"code\":400}}",
+                    "code": 400,
+                }
+            },
+        )
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_200_wrapped_input_length_raises_runtime_error(self, mock_post):
+        """HTTP 200 wrapping an input length error triggers RuntimeError."""
+        mock_post.return_value = _mock_response(
+            200,
+            {
+                "error": {
+                    "message": "HTTP 422: Input length: 177508 exceeds limit",
+                    "code": 422,
+                }
+            },
+        )
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_413_payload_too_large_raises_runtime_error(self, mock_post):
+        """HTTP 413 with 'payload too large' triggers RuntimeError."""
+        resp = MagicMock()
+        resp.status_code = 413
+        resp.json.return_value = {"error": "Payload too large"}
+        resp.headers = {}
+        mock_post.return_value = resp
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_413_empty_body_raises_runtime_error(self, mock_post):
+        """HTTP 413 with empty/non-JSON body still triggers RuntimeError."""
+        resp = MagicMock()
+        resp.status_code = 413
+        resp.json.side_effect = ValueError("No JSON")
+        resp.text = ""
+        resp.headers = {}
+        mock_post.return_value = resp
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_413_html_body_raises_runtime_error(self, mock_post):
+        """HTTP 413 with HTML body (nginx default) still triggers RuntimeError."""
+        resp = MagicMock()
+        resp.status_code = 413
+        resp.json.side_effect = ValueError("No JSON")
+        resp.text = "<html><body><h1>413 Request Entity Too Large</h1></body></html>"
+        resp.headers = {}
+        mock_post.return_value = resp
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_200_wrapped_payload_too_large_raises_runtime_error(self, mock_post):
+        """HTTP 200 wrapping 'payload too large' triggers RuntimeError."""
+        mock_post.return_value = _mock_response(
+            200,
+            {
+                "error": {
+                    "message": "HTTP 413: Payload too large",
+                    "code": 413,
+                }
+            },
+        )
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_200_wrapped_request_entity_too_large_raises_runtime_error(self, mock_post):
+        """HTTP 200 wrapping 'request entity too large' triggers RuntimeError."""
+        mock_post.return_value = _mock_response(
+            200,
+            {
+                "error": {
+                    "message": "Request Entity Too Large",
+                    "code": 413,
+                }
+            },
+        )
+
+        provider = _make_provider()
+        with pytest.raises(RuntimeError, match="context length exceeded"):
+            provider.embed_texts(["test"])
+
+    @patch("lib.providers.openrouter.requests.post")
+    def test_200_non_length_error_raises_embedding_error(self, mock_post):
+        """HTTP 200 with non-length error still raises EmbeddingError."""
+        mock_post.return_value = _mock_response(
+            200,
+            {"error": {"message": "Model not available", "code": 503}},
+        )
+
+        provider = _make_provider()
+        with pytest.raises(EmbeddingError, match="no 'data' field"):
+            provider.embed_texts(["test"])
