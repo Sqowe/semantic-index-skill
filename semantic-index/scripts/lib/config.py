@@ -32,7 +32,7 @@ class EmbeddingConfig:
     document_prefix: str = ""
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
-    max_embed_chars: int = 24000  # Pre-truncate texts exceeding this character limit
+    max_embed_chars: int = 20000  # Pre-truncate texts exceeding this character limit
     device: Optional[str] = None  # None=auto, "cpu", "cuda", "mps"
     trust_remote_code: bool = False  # Allow model repos to run arbitrary code
 
