@@ -81,6 +81,7 @@ class TestProviderInternalHalving:
         provider._doc_prefix = config.embedding.document_prefix
         provider._query_prefix = config.embedding.query_prefix
         provider._dimensions = config.embedding.dimensions
+        provider._max_embed_chars = config.embedding.max_embed_chars
         return provider
 
     def test_oom_succeeds_after_internal_halving(self) -> None:
@@ -157,7 +158,7 @@ class TestEmbedderBatchSplitting:
             _make_chunk("good chunk 3", 3),
         ]
 
-        with pytest.raises(EmbeddingError, match="OOM embedding a single chunk"):
+        with pytest.raises(EmbeddingError, match="Cannot embed single chunk"):
             embedder.embed_chunks(chunks)
 
         # Good chunks in batches without the bad chunk should be embedded
