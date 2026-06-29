@@ -253,6 +253,178 @@ class TestBM25Index:
         results = bm25.search("anything")
         assert results == []
 
+    def test_globstar_recurses_into_subdirs(self, tmp_path):
+        """'src/**' matches files nested any number of levels under src/."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search(
+            "authenticate user database",
+            top_k=10,
+            filters={"file_path_glob": "src/**"},
+        )
+        assert results, "expected matches under src/"
+        for r in results:
+            assert r["file_path"].startswith("src/")
+
+    def test_single_star_does_not_cross_slash(self, tmp_path):
+        """'src/*' matches direct children only, not nested files."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        # All sample src/ chunks live in subdirs (src/auth/, src/db/, src/api/),
+        # so a single-segment '*' after src/ must match none of them.
+        results = bm25.search(
+            "authenticate user database",
+            top_k=10,
+            filters={"file_path_glob": "src/*"},
+        )
+        assert results == []
+
+    def test_glob_excludes_docs(self, tmp_path):
+        """Reproduces the reported issue: 'src/**' must exclude docs/ chunks."""
+        index_dir = tmp_path / ".index"
+        index_dir.mkdir()
+
+        bm25 = BM25Index(str(tmp_path))
+        bm25.build(_make_chunks())
+
+        results = bm25.search(
+            "authentication guide user",
+            top_k=10,
+            filters={"file_path_glob": "src/**"},
+        )
+        assert all(not r["file_path"].startswith("docs/") for r in results)
+
+
+# ---------------------------------------------------------------------------
+# path_matches_glob helper tests
+# ---------------------------------------------------------------------------
+
+class TestPathMatchesGlob:
+    """Unit tests for the shared globstar path matcher."""
+
+    def test_globstar_spans_directories(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("src/auth/login.py", "src/**") is True
+        assert path_matches_glob("src/auth/sub/deep.py", "src/**") is True
+        assert path_matches_glob("src/main.py", "src/**") is True
+
+    def test_globstar_excludes_other_roots(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("docs/chats/x.md", "src/**") is False
+        assert path_matches_glob("docs/design/y.md", "src/**") is False
+
+    def test_single_star_within_segment(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("src/main.py", "src/*") is True
+        assert path_matches_glob("src/auth/login.py", "src/*") is False
+
+    def test_extension_globstar(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("src/a.py", "**/*.py") is True
+        assert path_matches_glob("README.md", "**/*.py") is False
+
+    def test_empty_glob_matches_everything(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("anything/at/all.py", "") is True
+
+    def test_windows_separators_normalised(self):
+        from lib.constants import path_matches_glob
+        assert path_matches_glob("src\\auth\\login.py", "src/**") is True
+
+
+# ---------------------------------------------------------------------------
+# Vector store file_path_glob filter tests
+# ---------------------------------------------------------------------------
+
+class TestVectorStorePathFilter:
+    """Integration tests verifying file_path_glob is applied in vector search."""
+
+    @staticmethod
+    def _make_store(tmp_path, paths):
+        """Build a VectorStore with one 4-dim chunk per given file path."""
+        from lib.config import Config, EmbeddingConfig
+        from lib.models import Chunk, ChunkType
+        from lib.store import VectorStore
+
+        config = Config()
+        config.embedding = EmbeddingConfig(dimensions=4)
+        store = VectorStore(str(tmp_path), config)
+
+        chunks = []
+        for i, path in enumerate(paths):
+            chunk = Chunk(
+                id=f"c{i}",
+                file_path=path,
+                start_line=1,
+                end_line=2,
+                content=f"content for {path}",
+                chunk_type=ChunkType.FUNCTION,
+                language="python",
+                symbol_name=f"sym{i}",
+                token_count=5,
+            )
+            # All identical vectors so ranking is uniform and the glob filter
+            # is the only thing that changes the result set.
+            chunk.metadata["vector"] = [0.1, 0.2, 0.3, 0.4]
+            chunks.append(chunk)
+
+        store.add(chunks)
+        return store
+
+    def test_vector_glob_restricts_results(self, tmp_path):
+        """file_path_glob excludes non-matching files in vector search."""
+        store = self._make_store(tmp_path, [
+            "src/auth/login.py",
+            "src/db/conn.py",
+            "docs/chats/notes.md",
+            "docs/design/spec.md",
+        ])
+
+        results = store.search(
+            vector=[0.1, 0.2, 0.3, 0.4],
+            top_k=10,
+            filters={"file_path_glob": "src/**"},
+        )
+        assert results, "expected matches under src/"
+        for r in results:
+            assert r["file_path"].startswith("src/")
+
+    def test_vector_no_filter_returns_all(self, tmp_path):
+        """Without a glob, docs/ chunks are included (control case)."""
+        store = self._make_store(tmp_path, [
+            "src/auth/login.py",
+            "docs/chats/notes.md",
+        ])
+
+        results = store.search(vector=[0.1, 0.2, 0.3, 0.4], top_k=10)
+        paths = {r["file_path"] for r in results}
+        assert "docs/chats/notes.md" in paths
+
+    def test_vector_glob_fills_top_k_from_allowed_set(self, tmp_path):
+        """top_k is filled from matching rows, not starved by excluded ones."""
+        # Many docs/ chunks plus a few src/ chunks; the matcher must surface
+        # the src/ rows rather than returning whatever ranked first.
+        paths = [f"docs/chats/note{i}.md" for i in range(20)]
+        paths += ["src/a.py", "src/b.py", "src/c.py"]
+        store = self._make_store(tmp_path, paths)
+
+        results = store.search(
+            vector=[0.1, 0.2, 0.3, 0.4],
+            top_k=3,
+            filters={"file_path_glob": "src/**"},
+        )
+        assert len(results) == 3
+        for r in results:
+            assert r["file_path"].startswith("src/")
+
 
 # ---------------------------------------------------------------------------
 # RRF Fusion tests
