@@ -12,11 +12,11 @@ import logging
 import math
 import os
 import re
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import Config, INDEX_DIR_NAME
+from .constants import path_matches_glob
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +222,7 @@ class BM25Index:
 
                 # Apply file path glob filter
                 path_glob = filters.get("file_path_glob")
-                if path_glob and not fnmatch(doc["file_path"], path_glob):
+                if path_glob and not path_matches_glob(doc["file_path"], path_glob):
                     continue
 
             results.append({

@@ -13,12 +13,19 @@ import lancedb
 import pyarrow as pa
 
 from .config import Config, INDEX_DIR_NAME
+from .constants import path_matches_glob
 from .models import Chunk, IndexingError
 
 logger = logging.getLogger(__name__)
 
 LANCEDB_DIR = "lancedb"
 TABLE_NAME = "chunks"
+
+# Over-fetch bounds for the file_path_glob post-filter. A glob can exclude
+# most candidates, so we fetch more than top_k and filter in Python. The
+# floor guarantees a useful pool for tiny top_k; the cap bounds memory/latency.
+_GLOB_OVERFETCH_FLOOR = 200
+_GLOB_OVERFETCH_CAP = 2000
 
 
 def _build_schema(embedding_dim: int) -> pa.Schema:
@@ -162,9 +169,19 @@ class VectorStore:
         if table is None:
             return []
 
-        query = table.search(vector).metric("cosine").limit(top_k)
+        path_glob = filters.get("file_path_glob") if filters else None
 
-        # Apply language filter if specified
+        # LanceDB's .where() is SQL and has no glob operator, so file_path_glob
+        # is applied as a Python post-filter below. When a glob is active we
+        # over-fetch candidates so that, after filtering, top_k can still be
+        # filled from the allowed set rather than starved by excluded rows.
+        fetch_limit = top_k
+        if path_glob:
+            fetch_limit = min(max(top_k * 10, _GLOB_OVERFETCH_FLOOR), _GLOB_OVERFETCH_CAP)
+
+        query = table.search(vector).metric("cosine").limit(fetch_limit)
+
+        # Apply language filter if specified (pushed down to LanceDB)
         if filters:
             lang = filters.get("language")
             if lang:
@@ -179,13 +196,19 @@ class VectorStore:
         # Convert LanceDB distance to similarity score (cosine distance → similarity)
         output: list[dict[str, Any]] = []
         for row in results:
+            file_path = row.get("file_path", "")
+
+            # Apply file path glob filter (post-filter; see fetch_limit above)
+            if path_glob and not path_matches_glob(file_path, path_glob):
+                continue
+
             # LanceDB returns _distance (cosine distance), convert to similarity
             distance = row.get("_distance", 0.0)
             score = 1.0 - distance
 
             output.append({
                 "score": round(score, 4),
-                "file_path": row.get("file_path", ""),
+                "file_path": file_path,
                 "start_line": row.get("start_line", 0),
                 "end_line": row.get("end_line", 0),
                 "content": row.get("content", ""),
@@ -195,6 +218,9 @@ class VectorStore:
                 "token_count": row.get("token_count", 0),
                 "id": row.get("id", ""),
             })
+
+            if len(output) >= top_k:
+                break
 
         return output
 
