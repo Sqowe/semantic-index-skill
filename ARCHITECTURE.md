@@ -77,11 +77,13 @@ semantic-index/                     # SKILL root (installed to ~/.kiro/skills/)
 │       ├── store.py bm25.py        # Storage: vector + keyword
 │       ├── fusion.py reranker.py   # Search: RRF merge + optional reranking
 │       └── constants.py            # Shared constants
-└── tests/                          # pytest suite (10 test files)
+└── tests/                          # pytest suite (11 test files)
 ```
 
 **Critical paths:** Entry points are `build_index.py`, `semantic_search.py`, `index_status.py`.
 Config template: `assets/default-config.json`. Per-project data: `<project>/.index/` (gitignored).
+`lib/constants.py` is stdlib-only (no tiktoken/tree-sitter) so it's safe to import from anywhere,
+including `hasher.py` and `migrate_config.py`, without pulling in heavy optional deps.
 
 ---
 
@@ -207,15 +209,15 @@ Defaults (`assets/default-config.json`) → `.index/config.json` (per-project) �
 | Zone | Component | Notes |
 |------|-----------|-------|
 | ✅ Stable | `models.py`, `config.py`, `hasher.py` | Core data model and config. Everything depends on these. |
-| ✅ Stable | `chunkers/code.py`, `chunkers/markdown.py` | Battle-tested across real projects. |
 | ✅ Stable | `chunker.py` (dispatch) | Extend by adding new chunkers, don't restructure. |
 | ✅ Stable | `store.py`, `embedder.py`, `providers/openrouter.py` | Stable interfaces. Retry, batching, caching all done. |
 | ✅ Stable | `bm25.py`, `fusion.py` | Hybrid search pipeline. Tune via config, not code. |
 | ✅ Stable | CLI scripts (build, search, status) | JSON output format is a contract — don't break it. |
+| 🔄 Semi-Stable | `chunkers/code.py`, `chunkers/markdown.py`, `chunkers/common.py` | Battle-tested overall, but currently under active revision (chunk-token-budget fixes) — re-check before relying on exact chunk boundaries. |
 | 🔄 Semi-Stable | `providers/huggingface.py`, `reranker.py` | Working. May evolve with new models/backends. |
 | 🔄 Semi-Stable | `chunkers/dita.py` | Functional for standard DITA. Exotic specializations may need updates. |
 | 🔄 Semi-Stable | `mcp_server.py` | Functional bridge. May evolve with MCP protocol updates. |
-| ⚠️ Experimental | `chunkers/office.py` | PDF/DOCX/PPTX working but edge cases remain (scanned PDFs, complex tables). |
+| ⚠️ Experimental | `chunkers/office.py` | PDF/DOCX/PPTX working but edge cases remain (scanned PDFs, complex tables); also under active revision alongside the other chunkers. |
 | ⚠️ Experimental | `migrate_config.py` | Config migration. Needs more real-world testing. |
 | 🔮 Planned | Parallel chunking (`lib/parallel.py`) | Phase 8 — not yet implemented. |
 | 🔮 Planned | Additional providers (Ollama, OpenAI) | Phase 6 — not yet implemented. |
