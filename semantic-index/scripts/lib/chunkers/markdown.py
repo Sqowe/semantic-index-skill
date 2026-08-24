@@ -8,7 +8,7 @@ Sections exceeding max_tokens are split at paragraph boundaries.
 import re
 from bisect import bisect_right
 
-from .common import count_tokens, get_tokenizer, make_chunk_id
+from .common import count_tokens, hard_split_by_tokens, make_chunk_id
 from ..config import Config
 from ..models import Chunk, ChunkType
 
@@ -330,33 +330,7 @@ def _split_text_by_paragraphs(
 def _split_line_by_tokens(line: str, max_tokens: int) -> list[str]:
     """Hard-split a single long line into pieces respecting max_tokens.
 
-    Uses tiktoken to split at exact token boundaries. Includes a
-    round-trip safety check to guarantee UTF-8 fidelity — if a token
-    slice doesn't decode cleanly, falls back to extending/shrinking
-    the window until the round-trip is valid.
+    Thin wrapper over the shared splitter in common.py, kept for the
+    call sites that already use this name.
     """
-    enc = get_tokenizer()
-    tokens = enc.encode(line)
-    pieces: list[str] = []
-
-    i = 0
-    while i < len(tokens):
-        end = min(i + max_tokens, len(tokens))
-        token_slice = tokens[i:end]
-        decoded = enc.decode(token_slice)
-
-        # Round-trip check: ensure no corruption from mid-character splits
-        if enc.encode(decoded) != token_slice:
-            # Shrink window until round-trip is clean
-            while end > i + 1:
-                end -= 1
-                token_slice = tokens[i:end]
-                decoded = enc.decode(token_slice)
-                if enc.encode(decoded) == token_slice:
-                    break
-
-        if decoded:
-            pieces.append(decoded)
-        i = end
-
-    return pieces if pieces else [line]
+    return hard_split_by_tokens(line, max_tokens)

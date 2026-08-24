@@ -14,7 +14,7 @@ import re
 from bisect import bisect_right
 from typing import Optional
 
-from .common import count_tokens, make_chunk_id, chunk_text_fallback
+from .common import build_chunks, count_tokens, make_chunk_id, chunk_text_fallback
 from ..config import Config
 from ..models import Chunk, ChunkType
 
@@ -459,6 +459,20 @@ def _split_oversized_chunk(
         if trailing.strip():
             parts_with_offsets.append((trailing, prev_end))
 
+    def emit(chunk_text: str, s_line: int) -> list[Chunk]:
+        """Build chunks for one accumulated text, hard-splitting if oversized."""
+        return build_chunks(
+            chunk_text,
+            file_path=file_path,
+            start_line=s_line,
+            language=language,
+            chunk_type=chunk_type,
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            symbol_name=symbol_name,
+            metadata=metadata,
+        )
+
     if len(parts_with_offsets) > 1:
         chunks: list[Chunk] = []
         current_parts: list[str] = []
@@ -468,23 +482,8 @@ def _split_oversized_chunk(
         for part, offset in parts_with_offsets:
             part_tokens = count_tokens(part)
             if current_tokens + part_tokens > max_tokens and current_parts:
-                chunk_text = "\n\n".join(current_parts)
-                tc = count_tokens(chunk_text)
                 s_line = start_line + content[:current_start_offset].count("\n")
-                e_line = s_line + chunk_text.count("\n")
-                if tc >= min_tokens:
-                    chunks.append(Chunk(
-                        id=make_chunk_id(file_path, chunk_text, s_line),
-                        file_path=file_path,
-                        start_line=s_line,
-                        end_line=e_line,
-                        content=chunk_text,
-                        chunk_type=chunk_type,
-                        language=language,
-                        symbol_name=symbol_name,
-                        token_count=tc,
-                        metadata=metadata.copy(),
-                    ))
+                chunks.extend(emit("\n\n".join(current_parts), s_line))
                 current_start_offset = offset
                 current_parts = []
                 current_tokens = 0
@@ -493,23 +492,8 @@ def _split_oversized_chunk(
             current_tokens += part_tokens
 
         if current_parts:
-            chunk_text = "\n\n".join(current_parts)
-            tc = count_tokens(chunk_text)
             s_line = start_line + content[:current_start_offset].count("\n")
-            e_line = s_line + chunk_text.count("\n")
-            if tc >= min_tokens:
-                chunks.append(Chunk(
-                    id=make_chunk_id(file_path, chunk_text, s_line),
-                    file_path=file_path,
-                    start_line=s_line,
-                    end_line=e_line,
-                    content=chunk_text,
-                    chunk_type=chunk_type,
-                    language=language,
-                    symbol_name=symbol_name,
-                    token_count=tc,
-                    metadata=metadata.copy(),
-                ))
+            chunks.extend(emit("\n\n".join(current_parts), s_line))
 
         if chunks:
             return chunks
@@ -524,21 +508,7 @@ def _split_oversized_chunk(
     for line in lines:
         line_tokens = count_tokens(line)
         if current_tokens + line_tokens > max_tokens and current_lines:
-            chunk_text = "\n".join(current_lines)
-            tc = count_tokens(chunk_text)
-            if tc >= min_tokens:
-                chunks.append(Chunk(
-                    id=make_chunk_id(file_path, chunk_text, current_line),
-                    file_path=file_path,
-                    start_line=current_line,
-                    end_line=current_line + len(current_lines) - 1,
-                    content=chunk_text,
-                    chunk_type=chunk_type,
-                    language=language,
-                    symbol_name=symbol_name,
-                    token_count=tc,
-                    metadata=metadata.copy(),
-                ))
+            chunks.extend(emit("\n".join(current_lines), current_line))
             current_line = current_line + len(current_lines)
             current_lines = []
             current_tokens = 0
@@ -547,21 +517,7 @@ def _split_oversized_chunk(
         current_tokens += line_tokens
 
     if current_lines:
-        chunk_text = "\n".join(current_lines)
-        tc = count_tokens(chunk_text)
-        if tc >= min_tokens:
-            chunks.append(Chunk(
-                id=make_chunk_id(file_path, chunk_text, current_line),
-                file_path=file_path,
-                start_line=current_line,
-                end_line=current_line + len(current_lines) - 1,
-                content=chunk_text,
-                chunk_type=chunk_type,
-                language=language,
-                symbol_name=symbol_name,
-                token_count=tc,
-                metadata=metadata.copy(),
-            ))
+        chunks.extend(emit("\n".join(current_lines), current_line))
 
     return chunks
 

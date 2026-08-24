@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..config import Config
 from ..models import Chunk, ChunkType
-from .common import count_tokens, get_tokenizer, make_chunk_id
+from .common import count_tokens, hard_split_by_tokens, make_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +116,12 @@ def _hard_split_by_words(text: str, max_tokens: int) -> list[str]:
 
 
 def _split_by_chars(text: str, max_tokens: int, out: list[str]) -> None:
-    """Split *text* into character slices that each fit within *max_tokens*."""
-    tokenizer = get_tokenizer()
-    encoded = tokenizer.encode(text)
-    for i in range(0, len(encoded), max_tokens):
-        segment = tokenizer.decode(encoded[i : i + max_tokens])
-        if segment:
-            out.append(segment)
+    """Split *text* into slices that each fit within *max_tokens*.
+
+    Delegates to the shared splitter in common.py, which adds a round-trip
+    check so a slice never ends mid-character.
+    """
+    out.extend(piece for piece in hard_split_by_tokens(text, max_tokens) if piece)
 
 
 def chunk_office(
