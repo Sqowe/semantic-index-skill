@@ -7,6 +7,7 @@ Covers:
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -725,6 +726,15 @@ class TestHuggingFaceProgressiveTruncation:
         provider._query_prefix = config.embedding.query_prefix
         provider._dimensions = config.embedding.dimensions
         provider._max_embed_chars = config.embedding.max_embed_chars
+        provider._max_embed_tokens = config.embedding.max_embed_tokens
+        # Use the resolver that __init__ would have built. ``test-model`` is
+        # not a real HF repo, so the resolver falls back to tiktoken
+        # cl100k_base — fine for the truncation math here.
+        from lib.tokenizer_resolver import resolver_for_config
+        provider._tokens = resolver_for_config(config)
+        provider._first_embed_truncate_warning_logged = False
+        provider._first_halving_warning_logged = False
+        provider._first_progressive_truncate_warning_logged = False
         return provider
 
     def test_single_text_oom_succeeds_after_truncation(self):
@@ -775,3 +785,57 @@ class TestHuggingFaceProgressiveTruncation:
 
         with pytest.raises(RuntimeError, match="Invalid buffer size"):
             provider.embed_texts(["x" * 200])
+
+    def test_halving_and_progressive_truncate_warnings_are_separate(self, caplog):
+        """The internal batch_size halving WARNING and the
+        ``_progressive_truncate_oom`` WARNING must use separate
+        sentinels. Halving always fires first; if they shared a
+        sentinel, the second event would log at DEBUG on every
+        build, hiding the more serious OOM-driven truncation.
+
+        Configure the provider with batch_size > 1 so the halving
+        path runs at least once; the second call then triggers
+        the progressive truncate path (because the OOM persists
+        down to batch_size=1, at which point the single text is
+        progressively shortened). Both events log at WARNING.
+        """
+        import numpy as np
+
+        provider = self._make_provider(max_chars=10000)
+        call_count = [0]
+
+        def mock_encode(texts, batch_size=32, **kwargs):
+            call_count[0] += 1
+            # Always OOM; the provider has to halve and then truncate.
+            raise RuntimeError("CUDA out of memory")
+
+        provider._model.encode = mock_encode
+        provider._batch_size = 4  # trigger halving path
+
+        with caplog.at_level(logging.WARNING, logger="lib.providers.huggingface"):
+            with pytest.raises(RuntimeError, match="out of memory"):
+                provider.embed_texts(["x" * 200])
+
+        halving_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "OOM at internal batch_size" in r.message
+        ]
+        progressive_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "Single text OOM" in r.message
+        ]
+        # The halving path is exercised, so we expect at least one
+        # WARNING for it. The progressive-truncate path is also
+        # exercised (the OOM persists down to batch_size=1) and must
+        # get its own WARNING \u2014 the sentinels are separate. If they
+        # were shared, the second event would log at DEBUG and
+        # ``progressive_warnings`` would be empty.
+        assert halving_warnings, (
+            "expected at least one halving WARNING; got none"
+        )
+        assert progressive_warnings, (
+            "expected at least one progressive-truncate WARNING; "
+            "sentinels may be shared between halving and progressive truncate"
+        )
