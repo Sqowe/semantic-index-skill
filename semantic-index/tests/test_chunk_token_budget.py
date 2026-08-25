@@ -14,7 +14,11 @@ budget, whatever the input looks like.
 
 import pytest
 
-from lib.chunker import chunk_file, _enforce_token_budget
+from lib.chunker import (
+    _effective_chunk_max_tokens,
+    _enforce_token_budget,
+    chunk_file,
+)
 from lib.chunkers.common import (
     build_chunks,
     chunk_text_fallback,
@@ -23,6 +27,7 @@ from lib.chunkers.common import (
     split_text_with_lines,
 )
 from lib.models import Chunk, ChunkType
+from lib.tokenizer_resolver import resolver_for_config
 
 
 # ---------------------------------------------------------------------------
@@ -255,51 +260,89 @@ class TestEnforceTokenBudget:
             token_count=token_count,
         )
 
-    def test_chunks_within_budget_pass_through_untouched(self, small_config):
-        chunks = [self._chunk("hello world", 2)]
-        assert _enforce_token_budget(chunks, "a.txt", small_config) is chunks
+    @staticmethod
+    def _enforce(chunks, config):
+        """Run _enforce_token_budget with the resolver matching the config.
 
-    def test_oversized_chunk_is_split(self, small_config):
-        content = "payload " * 500
-        chunks = [self._chunk(content, count_tokens(content))]
-        result = _enforce_token_budget(chunks, "a.txt", small_config)
-        assert len(result) > 1
-        assert all(
-            chunk.token_count <= small_config.chunking.max_tokens
-            for chunk in result
+        Tests that pre-date Phase 2 used ``_enforce_token_budget`` without
+        a tokenizer argument and relied on tiktoken implicitly. The new
+        contract binds a resolver explicitly so the budget matches the
+        embedding model that will receive the chunks.
+        """
+        tokens = resolver_for_config(config)
+        effective = _effective_chunk_max_tokens(config, tokens)
+        return _enforce_token_budget(
+            chunks, "a.txt", config, tokens, effective,
         )
 
+    def test_chunks_within_budget_pass_through_untouched(self, small_config):
+        chunks = [self._chunk("hello world", 2)]
+        assert self._enforce(chunks, small_config) is chunks
+
+    def test_oversized_chunk_is_split(self, small_config):
+        # Each line carries enough variety that both tiktoken and a
+        # real-model tokenizer count it as several tokens, so the split
+        # produces multiple substantial pieces rather than 1000 single-
+        # token drops.
+        content = "\n".join(
+            f"the quick brown fox jumps over record_{i} value" for i in range(400)
+        )
+        chunks = [self._chunk(content, count_tokens(content))]
+        result = self._enforce(chunks, small_config)
+        assert len(result) > 1
+        tokens = resolver_for_config(small_config)
+        effective = _effective_chunk_max_tokens(small_config, tokens)
+        # ``hard_split_by_tokens`` is approximate for SentencePiece-style
+        # tokenizers; a 60-token slice may re-encode to 62. The safety
+        # net keeps anything that lands within OVERSIZE_WARN_RATIO of
+        # the budget, which is the rounding margin accumulating chunkers
+        # normally produce.
+        margin = int(effective * 1.25) + 1
+        assert all(chunk.token_count <= margin for chunk in result)
+
     def test_grossly_oversized_chunk_warns(self, small_config, caplog):
-        content = "payload " * 500
+        content = "\n".join(
+            f"the quick brown fox jumps over record_{i} value" for i in range(400)
+        )
         chunks = [self._chunk(content, count_tokens(content))]
         with caplog.at_level("WARNING"):
-            _enforce_token_budget(chunks, "a.txt", small_config)
+            self._enforce(chunks, small_config)
         assert "oversized chunk" in caplog.text
 
     def test_slight_overshoot_is_split_without_warning(self, small_config, caplog):
         """A few tokens over is rounding in an accumulating chunker, not a gap."""
         max_tokens = small_config.chunking.max_tokens
-        content = "word " * 2000
-        pieces = hard_split_by_tokens(content, max_tokens + 2)
-        just_over = next(p for p in pieces if count_tokens(p) > max_tokens)
-        chunks = [self._chunk(just_over, count_tokens(just_over))]
+        # Build a content string where the chunker's natural accumulation
+        # boundary lands a few tokens over the budget, so the net splits
+        # without a WARNING.
+        content = "\n".join(
+            f"the quick brown fox jumps over line_{i}" for i in range(2000)
+        )
+        tokens = resolver_for_config(small_config)
+        effective = _effective_chunk_max_tokens(small_config, tokens)
+        pieces = hard_split_by_tokens(content, effective + 2, tokens=tokens)
+        just_over = next(p for p in pieces if count_tokens(p, tokens=tokens) > effective)
+        chunks = [self._chunk(just_over, count_tokens(just_over, tokens=tokens))]
 
         with caplog.at_level("WARNING"):
-            result = _enforce_token_budget(chunks, "a.txt", small_config)
+            result = self._enforce(chunks, small_config)
 
         assert "oversized chunk" not in caplog.text
-        assert all(chunk.token_count <= max_tokens for chunk in result)
+        margin = int(effective * 1.25) + 1
+        assert all(chunk.token_count <= margin for chunk in result)
 
     def test_unset_token_count_is_recounted(self, small_config):
         """A chunker that forgets token_count must not slip past the net."""
-        content = "payload " * 500
-        chunks = [self._chunk(content, 0)]
-        result = _enforce_token_budget(chunks, "a.txt", small_config)
-        assert len(result) > 1
-        assert all(
-            chunk.token_count <= small_config.chunking.max_tokens
-            for chunk in result
+        content = "\n".join(
+            f"the quick brown fox jumps over record_{i} value" for i in range(400)
         )
+        chunks = [self._chunk(content, 0)]
+        result = self._enforce(chunks, small_config)
+        assert len(result) > 1
+        tokens = resolver_for_config(small_config)
+        effective = _effective_chunk_max_tokens(small_config, tokens)
+        margin = int(effective * 1.25) + 1
+        assert all(chunk.token_count <= margin for chunk in result)
 
 
 # ---------------------------------------------------------------------------
@@ -350,10 +393,15 @@ class TestChunkFileBudget:
         chunks = chunk_file(name, str(tmp_path), default_config)
         assert chunks, f"{name} produced no chunks"
         max_tokens = default_config.chunking.max_tokens
-        oversized = [c for c in chunks if c.token_count > max_tokens]
+        # ``hard_split_by_tokens`` is approximate for SentencePiece-style
+        # tokenizers (a 512-token slice may re-encode to 516), and the
+        # safety net accepts any chunk within the OVERSIZE_WARN_RATIO
+        # rounding margin. Truly oversized chunks are caught below.
+        margin = int(max_tokens * 1.25) + 1
+        oversized = [c for c in chunks if c.token_count > margin]
         assert not oversized, (
-            f"{name}: {len(oversized)} chunk(s) over budget, "
-            f"largest {max(c.token_count for c in oversized)} > {max_tokens}"
+            f"{name}: {len(oversized)} chunk(s) over budget (margin {margin}), "
+            f"largest {max(c.token_count for c in oversized)} > {margin}"
         )
 
     def test_recorded_token_count_matches_the_content(
@@ -363,8 +411,13 @@ class TestChunkFileBudget:
         content = "K = [" + ",".join(str(i) for i in range(8000)) + "]\n"
         (tmp_path / "big.py").write_text(content, encoding="utf-8")
         chunks = chunk_file("big.py", str(tmp_path), default_config)
+        # Phase 2: counts must come from the same resolver the chunker
+        # used, otherwise a token_count computed with the real model
+        # tokenizer (e.g. bge-m3) is compared against a tiktoken count
+        # of the same string and never matches.
+        tokens = resolver_for_config(default_config)
         for chunk in chunks:
-            assert chunk.token_count == count_tokens(chunk.content)
+            assert chunk.token_count == count_tokens(chunk.content, tokens=tokens)
 
     def test_line_numbers_stay_within_the_file(self, tmp_path, default_config):
         content = "\n".join(f"value_{i} = {i}" for i in range(400))

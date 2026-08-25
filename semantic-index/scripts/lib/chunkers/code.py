@@ -14,7 +14,8 @@ import re
 from bisect import bisect_right
 from typing import Optional
 
-from .common import build_chunks, count_tokens, make_chunk_id, chunk_text_fallback
+from .common import build_chunks, count_tokens as _base_count_tokens, make_chunk_id, chunk_text_fallback
+from ..tokenizer_resolver import TokenizerWrapper
 from ..config import Config
 from ..models import Chunk, ChunkType
 
@@ -440,11 +441,15 @@ def _split_oversized_chunk(
     max_tokens: int,
     min_tokens: int,
     metadata: dict,
+    tokens: Optional["TokenizerWrapper"] = None,
 ) -> list[Chunk]:
     """Split an oversized code chunk at blank lines, then hard-split as last resort.
 
     Uses offset-based line tracking for accurate line numbers.
     """
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
     # Try splitting at blank lines first
     gap_pattern = re.compile(r"\n\n+")
     parts_with_offsets: list[tuple[str, int]] = []
@@ -471,6 +476,7 @@ def _split_oversized_chunk(
             min_tokens=min_tokens,
             symbol_name=symbol_name,
             metadata=metadata,
+            tokens=tokens,
         )
 
     if len(parts_with_offsets) > 1:
@@ -527,6 +533,8 @@ def chunk_code_with_treesitter(
     file_path: str,
     language: str,
     config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Chunk a code file using Tree-sitter AST parsing.
 
@@ -535,16 +543,31 @@ def chunk_code_with_treesitter(
     Oversized nodes are split at logical boundaries.
 
     Falls back to text splitting if Tree-sitter is unavailable.
+
+    Args:
+        content: File text.
+        file_path: Project-relative path.
+        language: Detected language.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
     parser = _get_parser(language)
     if parser is None:
-        return chunk_text_fallback(content, file_path, language, config)
+        return chunk_text_fallback(
+            content, file_path, language, config, tokens=tokens,
+        )
 
     source_bytes = content.encode("utf-8")
     tree = parser.parse(source_bytes)
     root = tree.root_node
 
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     extractable = set(EXTRACTABLE_NODES.get(language, []))
 
@@ -565,6 +588,7 @@ def chunk_code_with_treesitter(
         if is_class and count_tokens(node_text) > max_tokens:
             class_chunks = _chunk_class_node(
                 node, source_bytes, file_path, language, symbol, config,
+                tokens, max_tokens,
             )
             if class_chunks:
                 chunks.extend(class_chunks)
@@ -592,7 +616,7 @@ def chunk_code_with_treesitter(
             # Oversized — split it
             sub_chunks = _split_oversized_chunk(
                 node_text, file_path, start_line, language,
-                chunk_type, symbol, max_tokens, min_tokens, {},
+                chunk_type, symbol, max_tokens, min_tokens, {}, tokens,
             )
             chunks.extend(sub_chunks)
 
@@ -645,6 +669,7 @@ def chunk_code_with_treesitter(
                 sub = _split_oversized_chunk(
                     module_text, file_path, first_line, language,
                     ChunkType.MODULE_LEVEL, None, max_tokens, min_tokens, {},
+                    tokens,
                 )
                 chunks.extend(sub)
 
@@ -658,13 +683,30 @@ def _chunk_class_node(
     language: str,
     class_name: Optional[str],
     config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Extract methods from a class node as individual chunks.
 
     If the class is too large, each method becomes its own chunk.
     The class signature (without method bodies) becomes a separate chunk.
+
+    Args:
+        class_node: Tree-sitter class node.
+        source_bytes: Raw file bytes for offset-based extraction.
+        file_path: Project-relative path.
+        language: Detected language.
+        class_name: Class symbol name.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
-    max_tokens = config.chunking.max_tokens
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     method_types = set(METHOD_NODES.get(language, []))
     chunks: list[Chunk] = []
@@ -730,7 +772,7 @@ def _chunk_class_node(
                 sub = _split_oversized_chunk(
                     method_text, file_path, start_line, language,
                     ChunkType.METHOD, method_name, max_tokens, min_tokens,
-                    {"parent_class": class_name},
+                    {"parent_class": class_name}, tokens,
                 )
                 chunks.extend(sub)
 

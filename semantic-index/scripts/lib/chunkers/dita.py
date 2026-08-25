@@ -14,9 +14,10 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Optional
 
-from .common import count_tokens, get_tokenizer, make_chunk_id
+from .common import count_tokens as _base_count_tokens, get_tokenizer, hard_split_by_tokens, make_chunk_id
 from ..config import Config
 from ..models import Chunk, ChunkType
+from ..tokenizer_resolver import TokenizerWrapper, get_resolver as _resolver_get
 
 logger = logging.getLogger(__name__)
 
@@ -170,8 +171,13 @@ def _make_chunk(
     file_path: str, text: str, chunk_type: ChunkType,
     language: str, metadata: dict, title: Optional[str] = None,
     line_hint: int = 1,
+    count_tokens=None,
 ) -> Chunk:
-    """Build a Chunk with standard field computation."""
+    """Build a Chunk with standard field computation.
+
+    ``count_tokens`` is passed in from the caller so token counts match
+    the resolver chosen by the dispatch layer.
+    """
     meta = {**metadata, "line_approximate": True}
     return Chunk(
         id=make_chunk_id(file_path, text, line_hint),
@@ -190,13 +196,28 @@ def _make_chunk(
 def _chunk_topic(
     topic: ET.Element, file_path: str, config: Config,
     inherited_lang: Optional[str] = None,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Chunk a single DITA topic (not its nested child topics).
 
     Produces one chunk if it fits within max_tokens, otherwise splits
     at <section> boundaries within the body.
+
+    Args:
+        topic: XML element for the topic.
+        file_path: Project-relative path.
+        config: Loaded configuration.
+        inherited_lang: Optional XML language attribute from a parent.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
-    max_tokens = config.chunking.max_tokens
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     topic_tag = _strip_ns(topic.tag)
     lang = _get_lang(topic) or inherited_lang
@@ -231,43 +252,65 @@ def _chunk_topic(
     if tc <= max_tokens:
         if tc < min_tokens:
             return []
-        return [_make_chunk(file_path, full_text, ChunkType.DITA_TOPIC, "dita", meta, title)]
+        return [_make_chunk(file_path, full_text, ChunkType.DITA_TOPIC, "dita", meta, title, count_tokens=count_tokens)]
 
     if body_elem is None:
-        return [_make_chunk(file_path, full_text, ChunkType.DITA_TOPIC, "dita", meta, title)]
+        return [_make_chunk(file_path, full_text, ChunkType.DITA_TOPIC, "dita", meta, title, count_tokens=count_tokens)]
 
-    return _split_by_sections(body_elem, title, shortdesc, prefix, file_path, config, meta)
+    return _split_by_sections(
+        body_elem, title, shortdesc, prefix, file_path, config, meta,
+        count_tokens, tokens, effective_max,
+    )
 
 
-def _truncate_text(text: str, max_tokens: int) -> tuple[str, bool]:
+def _truncate_text(
+    text: str, max_tokens: int, count_tokens,
+    tokens: Optional["TokenizerWrapper"] = None,
+) -> tuple[str, bool]:
     """Truncate text to fit within max_tokens. Returns (text, was_truncated)."""
     if count_tokens(text) <= max_tokens:
         return text, False
     # Try line-level truncation first
     lines = text.split("\n")
     kept: list[str] = []
-    tokens = 0
+    tokens_count = 0
     for line in lines:
         line_tokens = count_tokens(line)
-        if tokens + line_tokens > max_tokens and kept:
+        if tokens_count + line_tokens > max_tokens and kept:
             break
         kept.append(line)
-        tokens += line_tokens
+        tokens_count += line_tokens
     result = "\n".join(kept)
-    # If still over (single long line), hard-truncate by tokens
+    # If still over (single long line), hard-truncate by tokens.
+    # Delegate to the shared splitter for the round-trip safety check.
+    # The tokenizer wrapper is the one threaded from the chunker
+    # entry point so the count matches whatever resolver is active
+    # (real model tokenizer when available, tiktoken fallback otherwise).
     if count_tokens(result) > max_tokens:
-        enc = get_tokenizer()
-        token_ids = enc.encode(result)[:max_tokens]
-        result = enc.decode(token_ids)
+        # If no explicit wrapper was threaded, fall back to the
+        # chunkers.common resolver's tiktoken wrapper. This preserves
+        # backward compatibility for direct callers (tests, etc.) that
+        # pass a count_tokens closure but no tokenizer.
+        wrapper = tokens if tokens is not None else _resolver_get("cl100k_base")
+        pieces = hard_split_by_tokens(result, max_tokens, tokens=wrapper)
+        result = pieces[0] if pieces else ""
     return result, True
 
 
 def _split_by_sections(
     body: ET.Element, title: str, shortdesc: str, prefix: str,
     file_path: str, config: Config, metadata: dict,
+    count_tokens=None,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
-    """Split an oversized topic body at <section> boundaries."""
-    max_tokens = config.chunking.max_tokens
+    """Split an oversized topic body at <section> boundaries.
+
+    ``effective_max`` is the safety-factor-adjusted chunk budget from the
+    chunker entry point. When None, falls back to
+    ``config.chunking.max_tokens`` (legacy behaviour).
+    """
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     ctx = "\n".join(p for p in [prefix, title] if p)
     chunks: list[Chunk] = []
@@ -280,10 +323,11 @@ def _split_by_sections(
         text = "\n".join([ctx] + parts) if ctx else "\n".join(parts)
         if count_tokens(text) < min_tokens:
             return
-        text, truncated = _truncate_text(text, max_tokens)
+        text, truncated = _truncate_text(text, max_tokens, count_tokens, tokens)
         meta = {**metadata, "truncated": True} if truncated else metadata
         chunks.append(_make_chunk(
             file_path, text, ChunkType.DITA_TOPIC, "dita", meta, title,
+            count_tokens=count_tokens,
         ))
 
     for child in body:
@@ -302,7 +346,7 @@ def _split_by_sections(
                 continue
             sec_idx += 1
             full = f"{ctx}\n{sec_text}" if ctx else sec_text
-            full, truncated = _truncate_text(full, max_tokens)
+            full, truncated = _truncate_text(full, max_tokens, count_tokens, tokens)
             if count_tokens(full) >= min_tokens:
                 sec_meta = {**metadata, "section_index": sec_idx}
                 if truncated:
@@ -310,6 +354,7 @@ def _split_by_sections(
                 chunks.append(_make_chunk(
                     file_path, full, ChunkType.DITA_TOPIC, "dita",
                     sec_meta, title, sec_idx,
+                    count_tokens=count_tokens,
                 ))
         else:
             child_text = _extract_text(child)
@@ -322,9 +367,15 @@ def _split_by_sections(
 
 def _chunk_ditamap(
     root: ET.Element, file_path: str, config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Parse a .ditamap into a single map overview chunk."""
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
     min_tokens = config.chunking.min_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     # Namespace-agnostic title lookup
     title_el = _find_child(root, "title", _TITLE_CLASS)
     map_title = ""
@@ -368,8 +419,7 @@ def _chunk_ditamap(
     if count_tokens(full_text) < min_tokens:
         return []
 
-    max_tokens = config.chunking.max_tokens
-    full_text, truncated = _truncate_text(full_text, max_tokens)
+    full_text, truncated = _truncate_text(full_text, max_tokens, count_tokens, tokens)
 
     lang = _get_lang(root)
     meta: dict = {"topic_type": "map"}
@@ -380,6 +430,7 @@ def _chunk_ditamap(
 
     return [_make_chunk(
         file_path, full_text, ChunkType.DITA_MAP, "ditamap", meta, map_title,
+        count_tokens=count_tokens,
     )]
 
 
@@ -399,6 +450,8 @@ def _collect_topics(root: ET.Element) -> list[ET.Element]:
 
 def chunk_dita(
     content: str, file_path: str, language: str, config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Chunk a DITA XML file into semantically meaningful pieces.
 
@@ -410,6 +463,10 @@ def chunk_dita(
         file_path: Relative path from project root.
         language: Detected language ("dita" or "ditamap").
         config: Loaded configuration.
+        tokens: Tokenizer wrapper to use for token counts and splits.
+            Defaults to the chunkers.common resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
 
     Returns:
         List of Chunk objects. May be empty if the file has no content.
@@ -438,7 +495,7 @@ def chunk_dita(
         return []
 
     if language == "ditamap" or _strip_ns(root.tag) in ("map", "bookmap"):
-        return _chunk_ditamap(root, file_path, config)
+        return _chunk_ditamap(root, file_path, config, tokens, effective_max)
 
     inherited_lang = _get_lang(root)
     chunks: list[Chunk] = []
@@ -446,7 +503,11 @@ def chunk_dita(
     # Collect ALL topics (root + nested) in document order
     for topic_elem in _collect_topics(root):
         topic_lang = _get_lang(topic_elem) or inherited_lang
-        chunks.extend(_chunk_topic(topic_elem, file_path, config, topic_lang))
+        chunks.extend(
+            _chunk_topic(
+                topic_elem, file_path, config, topic_lang, tokens, effective_max,
+            )
+        )
 
     if not chunks:
         logger.debug("No DITA topics found in %s", file_path)

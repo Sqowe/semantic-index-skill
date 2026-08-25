@@ -307,6 +307,17 @@ If it doesn't exist, `build_index.py` creates one from defaults on first run.
 Key settings the user might want to change:
 - `embedding.model`: which model to use (default: `BAAI/bge-m3`)
 - `embedding.dimensions`: vector size (default: 1024)
+- `embedding.max_embed_tokens`: the embedding model's context window in
+  tokens; the chunker counts tokens with this model's own tokenizer
+  when available (via the `tokenizers` package + Hugging Face cache)
+  and refuses to send anything larger (default: 8192, the context
+  window for `BAAI/bge-m3`).
+- `embedding.token_safety_factor`: when the chunker falls back to
+  tiktoken `cl100k_base` (because `tokenizers` is not installed or
+  the model's Hugging Face repo is not reachable), the chunking
+  budget is shrunk by this factor to account for the measured
+  ~1.30x (median) to ~2.13x (worst case) ratio between bge-m3 and
+  cl100k tokens (default: 1.6).
 - `chunking.max_tokens`: maximum chunk size (default: 512)
 - `chunking.overlap_tokens`: overlap between chunks (default: 50)
 - `indexing.file_extensions`: which file types to index

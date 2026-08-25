@@ -15,7 +15,8 @@ from typing import Optional
 
 from ..config import Config
 from ..models import Chunk, ChunkType
-from .common import count_tokens, hard_split_by_tokens, make_chunk_id
+from .common import count_tokens as _base_count_tokens, hard_split_by_tokens, make_chunk_id
+from ..tokenizer_resolver import TokenizerWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,20 @@ def _merge_range_metadata(meta_a: dict, meta_b: dict) -> dict:
     return merged
 
 
-def _hard_split_text(text: str, max_tokens: int) -> list[str]:
+def _hard_split_text(
+    text: str, max_tokens: int,
+    count_tokens=None,
+    tokens: Optional["TokenizerWrapper"] = None,
+) -> list[str]:
     """Split a single oversized text block into pieces under max_tokens.
 
     Tries sentence boundaries first ('. '), then falls back to word
     boundaries. Guarantees every returned piece is ≤ max_tokens.
+    ``tokens`` is threaded to the underlying splitters so the byte-level
+    fallback counts with the same resolver as everything else.
     """
+    if count_tokens is None:
+        count_tokens = _base_count_tokens
     if count_tokens(text) <= max_tokens:
         return [text]
 
@@ -76,20 +85,28 @@ def _hard_split_text(text: str, max_tokens: int) -> list[str]:
         result: list[str] = []
         for p in pieces:
             if count_tokens(p) > max_tokens:
-                result.extend(_hard_split_by_words(p, max_tokens))
+                result.extend(_hard_split_by_words(p, max_tokens, count_tokens, tokens))
             else:
                 result.append(p)
         return result
 
-    return _hard_split_by_words(text, max_tokens)
+    return _hard_split_by_words(text, max_tokens, count_tokens, tokens)
 
 
-def _hard_split_by_words(text: str, max_tokens: int) -> list[str]:
+def _hard_split_by_words(
+    text: str, max_tokens: int,
+    count_tokens=None,
+    tokens: Optional["TokenizerWrapper"] = None,
+) -> list[str]:
     """Last-resort splitter: break at word boundaries.
 
     Falls back to character-level splitting for single tokens that
-    exceed *max_tokens* (e.g. base64 blobs, long URLs).
+    exceed *max_tokens* (e.g. base64 blobs, long URLs). ``tokens`` is
+    threaded down to ``_split_by_chars`` so the byte-level fallback
+    counts with the same resolver as everything else.
     """
+    if count_tokens is None:
+        count_tokens = _base_count_tokens
     words = text.split()
     pieces: list[str] = []
     current: list[str] = []
@@ -111,17 +128,25 @@ def _hard_split_by_words(text: str, max_tokens: int) -> list[str]:
         if count_tokens(piece) <= max_tokens:
             final.append(piece)
         else:
-            _split_by_chars(piece, max_tokens, final)
+            _split_by_chars(piece, max_tokens, final, count_tokens, tokens)
     return final
 
 
-def _split_by_chars(text: str, max_tokens: int, out: list[str]) -> None:
+def _split_by_chars(
+    text: str, max_tokens: int, out: list[str],
+    count_tokens=None,
+    tokens: Optional["TokenizerWrapper"] = None,
+) -> None:
     """Split *text* into slices that each fit within *max_tokens*.
 
     Delegates to the shared splitter in common.py, which adds a round-trip
-    check so a slice never ends mid-character.
+    check so a slice never ends mid-character. ``tokens`` is the
+    resolver-backed wrapper to use for token counting and slicing; when
+    None, falls back to tiktoken ``cl100k_base`` (legacy behaviour).
     """
-    out.extend(piece for piece in hard_split_by_tokens(text, max_tokens) if piece)
+    if count_tokens is None:
+        count_tokens = _base_count_tokens
+    out.extend(piece for piece in hard_split_by_tokens(text, max_tokens, tokens=tokens) if piece)
 
 
 def chunk_office(
@@ -129,6 +154,8 @@ def chunk_office(
     file_path: str,
     language: str,
     config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Dispatch to the appropriate office format chunker.
 
@@ -137,17 +164,21 @@ def chunk_office(
         file_path: Relative path (from project root) for chunk metadata.
         language: One of "pdf", "docx", "pptx".
         config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
 
     Returns:
         List of Chunk objects. Empty if extraction fails or yields no text.
     """
     try:
         if language == "pdf":
-            return _chunk_pdf(abs_path, file_path, config)
+            return _chunk_pdf(abs_path, file_path, config, tokens, effective_max)
         elif language == "docx":
-            return _chunk_docx(abs_path, file_path, config)
+            return _chunk_docx(abs_path, file_path, config, tokens, effective_max)
         elif language == "pptx":
-            return _chunk_pptx(abs_path, file_path, config)
+            return _chunk_pptx(abs_path, file_path, config, tokens, effective_max)
         else:
             logger.warning("Unknown office format: %s", language)
             return []
@@ -159,12 +190,15 @@ def chunk_office(
 def _merge_short_chunks(
     chunks: list[Chunk],
     min_tokens: int,
+    count_tokens=None,
 ) -> list[Chunk]:
     """Merge consecutive chunks that are below min_tokens.
 
     Combines adjacent short chunks into one, updating line numbers,
     token counts, and generating a new chunk ID.
     """
+    if count_tokens is None:
+        count_tokens = _base_count_tokens
     if not chunks:
         return []
 
@@ -217,11 +251,15 @@ def _split_text_at_paragraphs(
     max_tokens: int,
     min_tokens: int,
     metadata: dict,
+    count_tokens=None,
+    tokens: Optional["TokenizerWrapper"] = None,
 ) -> list[Chunk]:
     """Split text at paragraph boundaries (double newlines) when it exceeds max_tokens.
 
     Returns one or more Chunk objects.
     """
+    if count_tokens is None:
+        count_tokens = _base_count_tokens
     if count_tokens(text) <= max_tokens:
         tc = count_tokens(text)
         if tc < min_tokens:
@@ -267,7 +305,7 @@ def _split_text_at_paragraphs(
                 current_parts = []
                 current_tokens = 0
 
-            for sub_piece in _hard_split_text(para, max_tokens):
+            for sub_piece in _hard_split_text(para, max_tokens, count_tokens, tokens):
                 tc = count_tokens(sub_piece)
                 if tc >= min_tokens:
                     chunks.append(Chunk(
@@ -342,11 +380,24 @@ def _extract_table_text(table) -> str:
 # PDF chunker
 # ---------------------------------------------------------------------------
 
-def _chunk_pdf(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
+def _chunk_pdf(
+    abs_path: str, file_path: str, config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
+) -> list[Chunk]:
     """Extract text from PDF pages and chunk by page boundaries.
 
     Uses PyMuPDF (fitz) for text extraction. Short consecutive pages
     are merged; long pages are split at paragraph boundaries.
+
+    Args:
+        abs_path: Absolute path to the PDF.
+        file_path: Project-relative path for chunk metadata.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
     try:
         import fitz  # PyMuPDF
@@ -358,8 +409,11 @@ def _chunk_pdf(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
         )
         return []
 
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
+
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
 
     try:
         doc = fitz.open(abs_path)
@@ -401,7 +455,7 @@ def _chunk_pdf(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
             text, file_path, ChunkType.PDF_PAGE, "pdf",
             base_line=page_num, max_tokens=max_tokens,
             min_tokens=0,  # don't filter yet, merge first
-            metadata=meta,
+            metadata=meta, count_tokens=count_tokens, tokens=tokens,
         )
         # If split produced nothing (empty after strip), create one chunk
         if not page_chunks:
@@ -419,19 +473,32 @@ def _chunk_pdf(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
             )]
         raw_chunks.extend(page_chunks)
 
-    return _merge_short_chunks(raw_chunks, min_tokens)
+    return _merge_short_chunks(raw_chunks, min_tokens, count_tokens)
 
 
 # ---------------------------------------------------------------------------
 # DOCX chunker
 # ---------------------------------------------------------------------------
 
-def _chunk_docx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
+def _chunk_docx(
+    abs_path: str, file_path: str, config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
+) -> list[Chunk]:
     """Extract text from DOCX by heading-based sections.
 
     Mirrors the markdown chunker: headings define section boundaries,
     body paragraphs are grouped under their nearest heading.
     Tables are extracted as row-by-row text.
+
+    Args:
+        abs_path: Absolute path to the DOCX.
+        file_path: Project-relative path for chunk metadata.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
     try:
         import docx  # python-docx
@@ -443,8 +510,11 @@ def _chunk_docx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
         )
         return []
 
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
+
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
 
     try:
         document = docx.Document(abs_path)
@@ -548,7 +618,7 @@ def _chunk_docx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
             sec["text"], file_path, ChunkType.DOCX_SECTION, "docx",
             base_line=sec["section_index"] + 1,
             max_tokens=max_tokens, min_tokens=min_tokens,
-            metadata=meta,
+            metadata=meta, count_tokens=count_tokens, tokens=tokens,
         )
         chunks.extend(sec_chunks)
 
@@ -559,11 +629,24 @@ def _chunk_docx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
 # PPTX chunker
 # ---------------------------------------------------------------------------
 
-def _chunk_pptx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
+def _chunk_pptx(
+    abs_path: str, file_path: str, config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
+) -> list[Chunk]:
     """Extract text from PPTX slides and chunk per slide.
 
     Includes text from all shapes (text frames, tables, groups)
     and speaker notes. Slides with no extractable text are skipped.
+
+    Args:
+        abs_path: Absolute path to the PPTX.
+        file_path: Project-relative path for chunk metadata.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
     try:
         from pptx import Presentation
@@ -576,8 +659,11 @@ def _chunk_pptx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
         )
         return []
 
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
+
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
 
     try:
         prs = Presentation(abs_path)
@@ -641,7 +727,7 @@ def _chunk_pptx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
             slide_text, file_path, ChunkType.PPTX_SLIDE, "pptx",
             base_line=slide_num, max_tokens=max_tokens,
             min_tokens=0,  # don't filter yet, merge first
-            metadata=meta,
+            metadata=meta, count_tokens=count_tokens, tokens=tokens,
         )
         if not slide_chunks:
             tc = count_tokens(slide_text)
@@ -658,4 +744,4 @@ def _chunk_pptx(abs_path: str, file_path: str, config: Config) -> list[Chunk]:
             )]
         raw_chunks.extend(slide_chunks)
 
-    return _merge_short_chunks(raw_chunks, min_tokens)
+    return _merge_short_chunks(raw_chunks, min_tokens, count_tokens)

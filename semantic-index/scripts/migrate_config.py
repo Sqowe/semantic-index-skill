@@ -56,6 +56,16 @@ EMBEDDING_DEFAULTS = {
     "max_embed_chars": 20000,
 }
 
+# Embedding fields added in Phase 2 (tokenizer resolution). ``max_embed_tokens``
+# is the model's context window in tokens (8192 for BAAI/bge-m3 by default).
+# ``token_safety_factor`` is the multiplier that shrinks the chunking budget
+# when the fallback tiktoken tokenizer is in use, to account for the
+# measured ratio between bge-m3 and cl100k tokens (median 1.30, worst 2.13).
+PHASE2_EMBEDDING_DEFAULTS = {
+    "max_embed_tokens": 8192,
+    "token_safety_factor": 1.6,
+}
+
 # Fields that should be removed (deprecated or moved to future phases)
 DEPRECATED_SEARCH_FIELDS: list[str] = []
 
@@ -109,6 +119,22 @@ def analyze_config(config: dict) -> list[dict]:
                 "field": f"embedding.{field}",
                 "action": "add",
                 "reason": f"New Phase 4 embedding field. Default: {default_value!r}",
+                "old_value": None,
+                "new_value": default_value,
+            })
+
+    # Phase 2: tokenizer resolution fields. These are added even when the
+    # Phase 4 fields already exist; the migration check is per-field.
+    for field, default_value in PHASE2_EMBEDDING_DEFAULTS.items():
+        if field not in embedding:
+            migrations.append({
+                "field": f"embedding.{field}",
+                "action": "add",
+                "reason": (
+                    "Phase 2 tokenizer resolution: align chunking budget with "
+                    "the embedding model's tokenizer. "
+                    f"Default: {default_value!r}"
+                ),
                 "old_value": None,
                 "new_value": default_value,
             })

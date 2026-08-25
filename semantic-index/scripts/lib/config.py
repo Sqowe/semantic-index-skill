@@ -33,6 +33,17 @@ class EmbeddingConfig:
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
     max_embed_chars: int = 20000  # Pre-truncate texts exceeding this character limit
+    # Real-model token budget. Default 8192 matches BAAI/bge-m3; the values
+    # in semantic-index/references/embedding-models.md are the source of
+    # truth for other models. The embed path counts tokens with the
+    # model's own tokenizer (when `tokenizers` + the HF repo are reachable)
+    # and refuses to send anything past this many tokens.
+    max_embed_tokens: int = 8192
+    # Multiplier on top of tiktoken's count when the real tokenizer is
+    # unavailable. Covers the measured ratio between bge-m3 and cl100k
+    # (median 1.30, worst case 2.13) plus margin. Not applied when the
+    # model's own tokenizer is loaded — that case has no fudge factor.
+    token_safety_factor: float = 1.6
     device: Optional[str] = None  # None=auto, "cpu", "cuda", "mps"
     trust_remote_code: bool = False  # Allow model repos to run arbitrary code
 
@@ -217,6 +228,20 @@ def _validate_config(config: Config) -> None:
         raise ConfigError(
             f"Invalid embedding.max_embed_chars: {config.embedding.max_embed_chars}. "
             "Must be >= 1."
+        )
+
+    if config.embedding.max_embed_tokens < 1:
+        raise ConfigError(
+            f"Invalid embedding.max_embed_tokens: "
+            f"{config.embedding.max_embed_tokens}. Must be >= 1."
+        )
+
+    if config.embedding.token_safety_factor < 1.0:
+        raise ConfigError(
+            f"Invalid embedding.token_safety_factor: "
+            f"{config.embedding.token_safety_factor}. Must be >= 1.0. "
+            "A factor below 1.0 would under-count tokens and risk "
+            "exceeding the model's context window."
         )
 
     # Numeric range validation for search settings
