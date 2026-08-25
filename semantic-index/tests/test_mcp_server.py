@@ -211,6 +211,160 @@ class TestBuildIndex:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 visibility — truncation fields in the MCP build response
+# ---------------------------------------------------------------------------
+
+
+class TestMCPBuildTruncationFields:
+    """The MCP build path mirrors the CLI's truncation visibility:
+    ``truncated_chunks`` (int), ``truncated_files`` (sorted list),
+    and ``truncation_message`` (only when count > 0). Pin the
+    behaviour here so a future regression in mcp_server.py's copy
+    of the accumulation logic is caught independently of the CLI.
+    """
+
+    def _run_mcp_build(
+        self,
+        files_to_index: list[str],
+        chunk_content: str,
+        truncation_records: list,
+    ) -> dict:
+        """Drive ``_build_index_sync`` with mocked dependencies and
+        return the resulting dict."""
+        from lib.models import Chunk
+
+        mock_load = MagicMock()
+        mock_chunk_obj = Chunk(
+            id="abc",
+            file_path=files_to_index[0],
+            start_line=1,
+            end_line=1,
+            content=chunk_content,
+            chunk_type=ChunkType.FUNCTION,
+            language="python",
+            symbol_name="f",
+            token_count=5,
+        )
+
+        with patch("mcp_server.load_config", return_value=mock_load), \
+             patch(
+                 "mcp_server.detect_changes",
+                 return_value=FileChange(
+                     to_index=files_to_index, to_delete=[], unchanged=0,
+                 ),
+             ), \
+             patch("mcp_server.ensure_index_dir"), \
+             patch("mcp_server.VectorStore") as mock_store_cls, \
+             patch("mcp_server.BM25Index") as mock_bm25_cls, \
+             patch("mcp_server.Embedder") as mock_embedder_cls, \
+             patch("mcp_server.chunk_file", return_value=[mock_chunk_obj]), \
+             patch("mcp_server.update_manifest"):
+            mock_bm25 = MagicMock()
+            mock_bm25.load.return_value = True
+            mock_bm25_cls.return_value = mock_bm25
+            mock_store = MagicMock()
+            mock_store.has_index.return_value = True
+            mock_store_cls.return_value = mock_store
+
+            # The Embedder mock's ``truncation_stats`` is read by
+            # _build_index_sync to compute the per-batch delta.
+            mock_embedder = MagicMock()
+            mock_embedder.embed_chunks.return_value = 1
+            mock_embedder.truncation_stats = list(truncation_records)
+            mock_embedder_cls.return_value = mock_embedder
+
+            return _build_index_sync(
+                BuildIndexInput(project_dir="/tmp/test")
+            )
+
+    def test_truncation_fields_present_when_zero(self):
+        """``truncated_chunks`` is always present (even when 0) so
+        callers can rely on the field existing."""
+        result = self._run_mcp_build(
+            files_to_index=["src/a.py"],
+            chunk_content="def f(): pass",
+            truncation_records=[],
+        )
+        assert result["status"] == "success"
+        assert "truncated_chunks" in result
+        assert result["truncated_chunks"] == 0
+        assert result["truncated_files"] == []
+        # No message when no truncations.
+        assert "truncation_message" not in result
+
+    def test_truncation_count_appears_in_mcp_response(self):
+        """Truncation records surface as ``truncated_chunks`` and
+        ``truncated_files`` in the MCP response, matching the CLI
+        summary shape."""
+        from lib.models import TruncationRecord
+        record = TruncationRecord(
+            file_path="src/big_data.py",
+            chunk_id="sha256:abc",
+            original_tokens=100,
+            final_tokens=8,
+        )
+        result = self._run_mcp_build(
+            files_to_index=["src/big_data.py"],
+            chunk_content="x" * 200,
+            truncation_records=[record],
+        )
+        assert result["truncated_chunks"] == 1
+        assert result["truncated_files"] == ["src/big_data.py"]
+        # Human-readable message names the count and the consequence.
+        assert "1 chunk(s) were shortened" in result["truncation_message"]
+        assert "their endings are not searchable" in result["truncation_message"]
+
+    def test_multiple_files_aggregate_correctly(self):
+        """Truncation records from multiple files all surface in the
+        response, with the file list sorted for deterministic output."""
+        from lib.models import TruncationRecord
+        records = [
+            TruncationRecord(
+                file_path=f"src/{name}.py",
+                chunk_id=f"sha256:{name}",
+                original_tokens=200,
+                final_tokens=8,
+            )
+            for name in ("a", "b", "c")
+        ]
+        result = self._run_mcp_build(
+            files_to_index=[r.file_path for r in records],
+            chunk_content="x" * 200,
+            truncation_records=records,
+        )
+        assert result["truncated_chunks"] == 3
+        assert result["truncated_files"] == [
+            "src/a.py", "src/b.py", "src/c.py",
+        ]
+
+    def test_duplicate_file_paths_deduplicated(self):
+        """Two truncations in the same file produce one entry in
+        ``truncated_files``, not two."""
+        from lib.models import TruncationRecord
+        records = [
+            TruncationRecord(
+                file_path="src/a.py",
+                chunk_id="sha256:1",
+                original_tokens=100,
+                final_tokens=8,
+            ),
+            TruncationRecord(
+                file_path="src/a.py",
+                chunk_id="sha256:2",
+                original_tokens=120,
+                final_tokens=8,
+            ),
+        ]
+        result = self._run_mcp_build(
+            files_to_index=["src/a.py"],
+            chunk_content="x" * 200,
+            truncation_records=records,
+        )
+        assert result["truncated_chunks"] == 2
+        assert result["truncated_files"] == ["src/a.py"]
+
+
+# ---------------------------------------------------------------------------
 # semantic_index_search
 # ---------------------------------------------------------------------------
 

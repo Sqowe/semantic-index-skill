@@ -178,9 +178,21 @@ Success output:
   "files_deleted": 2,
   "chunks_created": 387,
   "duration_seconds": 12.4,
-  "embedding_api_calls": 4
+  "embedding_api_calls": 4,
+  "truncated_chunks": 3,
+  "truncated_files": ["src/big_data.py"]
 }
 ```
+
+`truncated_chunks` counts chunks that were shortened to fit the
+embedding model's context window. Their full text is preserved in
+`chunk.metadata["original_content"]`; the embedding vector only
+covers the surviving prefix, so search hits on those chunks will
+miss anything past it. `truncated_files` lists the project-relative
+paths of files that contributed at least one truncated chunk.
+When `truncated_chunks > 0`, a `truncation_message` field is added
+with a human-readable summary; affected file paths are also
+emitted at DEBUG on the build's stderr stream.
 
 No changes output:
 ```json

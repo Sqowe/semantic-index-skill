@@ -32,6 +32,11 @@ from lib.fusion import fuse_results
 from lib.hasher import detect_changes, update_manifest
 from lib.models import ConfigError, EmbeddingError, IndexingError, SemanticIndexError
 from lib.store import VectorStore
+from lib.truncation_visibility import (
+    accumulate_truncation,
+    build_truncation_summary,
+    log_truncated_files,
+)
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -217,6 +222,10 @@ def _build_index_sync(params: BuildIndexInput) -> dict[str, Any]:
 
         total_chunks_created = 0
         total_api_calls = 0
+        # Phase 4 visibility: same fields as the CLI build summary so
+        # the MCP consumer sees the same truncation information.
+        total_truncated = 0
+        truncated_files: set[str] = set()
         chunk_counts: dict[str, int] = {}
         file_batch_size = max(1, params.batch_size)
 
@@ -232,6 +241,12 @@ def _build_index_sync(params: BuildIndexInput) -> dict[str, Any]:
                 # Embed first — this is the expensive/fallible step.
                 # If embedding fails, old index data is preserved intact.
                 batch_api_calls = embedder.embed_chunks(batch_chunks)
+                # Capture any truncations this batch produced. The
+                # shared helper handles the per-batch delta and file
+                # set accumulation; see ``truncation_visibility.py``.
+                total_truncated = accumulate_truncation(
+                    embedder, total_truncated, truncated_files,
+                )
 
             # Only mutate the store after embedding succeeds.
             # Delete old + add new as a tight pair.
@@ -272,7 +287,7 @@ def _build_index_sync(params: BuildIndexInput) -> dict[str, Any]:
         update_manifest(params.project_dir, changes, chunk_counts)
 
         duration = time.time() - start_time
-        return {
+        result = {
             "status": "success",
             "files_indexed": len(changes.to_index),
             "files_skipped": changes.unchanged,
@@ -281,6 +296,15 @@ def _build_index_sync(params: BuildIndexInput) -> dict[str, Any]:
             "duration_seconds": round(duration, 1),
             "embedding_api_calls": total_api_calls,
         }
+        # Phase 4 visibility: surface truncation count and affected
+        # files. Mirrors the build_index.py CLI summary so MCP and CLI
+        # consumers see the same fields. Both the dict and the
+        # per-file INFO log lines are produced by the shared helper
+        # in ``truncation_visibility.py`` so a fix applies to both
+        # call sites.
+        result.update(build_truncation_summary(total_truncated, truncated_files))
+        log_truncated_files(truncated_files)
+        return result
 
     except (ConfigError, EmbeddingError, IndexingError, SemanticIndexError) as exc:
         return _error_response(exc)
@@ -533,7 +557,9 @@ async def semantic_index_build(params: BuildIndexInput) -> dict[str, Any]:
 
     Returns:
         dict with keys: status, files_indexed, files_skipped, files_deleted,
-        chunks_created, duration_seconds, embedding_api_calls.
+        chunks_created, duration_seconds, embedding_api_calls,
+        truncated_chunks, truncated_files, truncation_message
+        (truncation_message is present only when truncated_chunks > 0).
         On error: status="error", error, error_type.
     """
     return await asyncio.to_thread(_build_index_sync, params)
