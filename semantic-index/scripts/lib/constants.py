@@ -13,6 +13,12 @@ OFFICE_EXTENSIONS: frozenset[str] = frozenset({".pdf", ".docx", ".pptx"})
 # Language identifiers for binary formats (dot-stripped).
 BINARY_FORMATS: frozenset[str] = frozenset({"pdf", "docx", "pptx"})
 
+# C++ source and header suffixes beyond the original ".cpp"/".hpp" pair.
+# Kept here so the default config, the migration script, and the language
+# map cannot drift apart. ".txx" is a template implementation header —
+# C++ definitions that a ".h" includes.
+CPP_EXTENSIONS: tuple[str, ...] = (".cc", ".cxx", ".hh", ".hxx", ".txx")
+
 
 def path_matches_glob(file_path: str, glob: str) -> bool:
     """Match a project-relative file path against a glob pattern.

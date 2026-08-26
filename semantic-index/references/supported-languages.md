@@ -97,7 +97,7 @@ Languages without a Tree-sitter grammar fall back to blank-line splitting.
 | Attribute | Value |
 |-----------|-------|
 | Grammar package | `tree-sitter-cpp` |
-| File extensions | `.cpp`, `.hpp` |
+| File extensions | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` |
 | Top-level nodes | `function_definition`, `class_specifier`, `struct_specifier`, `enum_specifier`, `namespace_definition`, `template_declaration`, `type_definition`, `declaration` |
 | Method nodes | `function_definition` (inside class body); `field_declaration` nodes containing a `function_declarator` are also recognized as methods during oversized class splitting |
 | Body node types | `field_declaration_list`, `declaration_list` |
@@ -251,7 +251,7 @@ optional — install via `bash setup.sh --with-office`.
 | `.rs` | Rust | Tree-sitter AST |
 | `.java` | Java | Tree-sitter AST |
 | `.c`, `.h` | C | Tree-sitter AST |
-| `.cpp`, `.hpp` | C++ | Tree-sitter AST |
+| `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` | C++ | Tree-sitter AST |
 | `.rb` | Ruby | Tree-sitter AST |
 | `.php` | PHP | Tree-sitter AST |
 | `.md`, `.mdx` | Markdown | Header-based |

@@ -39,6 +39,11 @@ class TestLanguageDetection:
         ("util.h", "c"),
         ("widget.cpp", "cpp"),
         ("widget.hpp", "cpp"),
+        ("widget.cc", "cpp"),
+        ("widget.cxx", "cpp"),
+        ("widget.hh", "cpp"),
+        ("widget.hxx", "cpp"),
+        ("widget.txx", "cpp"),
         ("app.rb", "ruby"),
         ("index.php", "php"),
     ])

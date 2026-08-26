@@ -64,6 +64,7 @@ class IndexingConfig:
     file_extensions: list[str] = field(default_factory=lambda: [
         ".py", ".js", ".ts", ".tsx", ".jsx",
         ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
+        ".cc", ".cxx", ".hh", ".hxx", ".txx",
         ".rb", ".php",
         ".md", ".mdx", ".txt", ".rst",
         ".dita", ".ditamap",

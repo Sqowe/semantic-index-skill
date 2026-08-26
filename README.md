@@ -670,7 +670,7 @@ AST-aware chunking via Tree-sitter is available for 10 languages:
 | Rust | `.rs` | functions, structs, impl blocks |
 | Java | `.java` | classes, methods, interfaces |
 | C | `.c`, `.h` | functions, structs, typedefs |
-| C++ | `.cpp`, `.hpp` | functions, classes, namespaces |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` | functions, classes, namespaces |
 | Ruby | `.rb` | modules, classes, methods |
 | PHP | `.php` | classes, functions, methods |
 

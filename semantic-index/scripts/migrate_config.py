@@ -26,7 +26,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from lib.constants import OFFICE_EXTENSIONS  # noqa: E402
+from lib.constants import CPP_EXTENSIONS, OFFICE_EXTENSIONS  # noqa: E402
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -198,6 +198,23 @@ def analyze_config(config: dict) -> list[dict]:
             ),
             "old_value": current_exts if current_exts else None,
             "new_value": current_exts + missing_office,
+        })
+
+    # Check for missing C++ file extensions
+    # Re-read extensions in case the office migration updated them
+    current_exts = current_exts + missing_office
+    missing_cpp = [ext for ext in CPP_EXTENSIONS if ext not in current_exts]
+    if missing_cpp:
+        migrations.append({
+            "field": "indexing.file_extensions",
+            "action": "update" if current_exts else "add",
+            "reason": (
+                f"C++ source coverage: add {', '.join(missing_cpp)}. "
+                "Only .cpp/.hpp were indexed, so codebases using the .cc/.hh "
+                "convention were skipped entirely."
+            ),
+            "old_value": current_exts if current_exts else None,
+            "new_value": current_exts + missing_cpp,
         })
 
     # Check for missing max_office_file_size_kb (Phase 9)
