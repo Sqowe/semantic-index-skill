@@ -3,6 +3,8 @@
 Routes files to the appropriate chunking strategy based on language:
 - Markdown files: header-based splitting (chunkers/markdown.py)
 - Python/JS/TS: Tree-sitter AST-aware splitting (chunkers/code.py)
+- YAML: indentation-aware splitting (chunkers/yaml_config.py)
+- Helm .tpl: define-block splitting (chunkers/helm_template.py)
 - Other: blank-line fallback splitting (chunkers/common.py)
 
 Shared helpers live in chunkers/common.py to avoid circular imports.
@@ -173,6 +175,8 @@ def chunk_file(
     - Office documents (PDF/DOCX/PPTX): binary extraction via office chunker
     - Markdown files: header-based splitting
     - Python/JS/TS: Tree-sitter AST-aware splitting
+    - YAML: indentation-aware splitting by key path
+    - Helm .tpl: one chunk per named template definition
     - Other: blank-line fallback splitting
 
     Whatever the strategy, the result passes through
@@ -220,6 +224,14 @@ def chunk_file(
     elif language in ("dita", "ditamap"):
         from .chunkers.dita import chunk_dita
         chunks = chunk_dita(content, file_path, language, config, tokens, effective_max)
+    elif language == "yaml":
+        from .chunkers.yaml_config import chunk_yaml
+        chunks = chunk_yaml(content, file_path, language, config, tokens, effective_max)
+    elif language == "helm":
+        from .chunkers.helm_template import chunk_helm_template
+        chunks = chunk_helm_template(
+            content, file_path, language, config, tokens, effective_max,
+        )
     elif language in TREESITTER_LANGUAGES:
         from .chunkers.code import chunk_code_with_treesitter
         chunks = chunk_code_with_treesitter(

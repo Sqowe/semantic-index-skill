@@ -19,6 +19,11 @@ BINARY_FORMATS: frozenset[str] = frozenset({"pdf", "docx", "pptx"})
 # C++ definitions that a ".h" includes.
 CPP_EXTENSIONS: tuple[str, ...] = (".cc", ".cxx", ".hh", ".hxx", ".txx")
 
+# Structured-configuration suffixes. YAML is chunked by indentation and
+# ".tpl" by Helm ``define`` blocks; see chunkers/yaml_config.py and
+# chunkers/helm_template.py.
+CONFIG_EXTENSIONS: tuple[str, ...] = (".yaml", ".yml", ".tpl")
+
 
 def path_matches_glob(file_path: str, glob: str) -> bool:
     """Match a project-relative file path against a glob pattern.

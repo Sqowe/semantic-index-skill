@@ -67,6 +67,7 @@ class IndexingConfig:
         ".cc", ".cxx", ".hh", ".hxx", ".txx",
         ".rb", ".php",
         ".md", ".mdx", ".txt", ".rst",
+        ".yaml", ".yml", ".tpl",
         ".dita", ".ditamap",
         ".pdf", ".docx", ".pptx",
     ])

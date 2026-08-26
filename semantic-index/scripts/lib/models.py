@@ -19,6 +19,7 @@ class ChunkType(Enum):
     PDF_PAGE = "pdf_page"
     DOCX_SECTION = "docx_section"
     PPTX_SLIDE = "pptx_slide"
+    CONFIG_BLOCK = "config_block"
     UNKNOWN = "unknown"
 
 

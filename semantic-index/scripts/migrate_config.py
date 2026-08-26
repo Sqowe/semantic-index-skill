@@ -26,7 +26,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from lib.constants import CPP_EXTENSIONS, OFFICE_EXTENSIONS  # noqa: E402
+from lib.constants import CONFIG_EXTENSIONS, CPP_EXTENSIONS, OFFICE_EXTENSIONS  # noqa: E402
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -215,6 +215,23 @@ def analyze_config(config: dict) -> list[dict]:
             ),
             "old_value": current_exts if current_exts else None,
             "new_value": current_exts + missing_cpp,
+        })
+
+    # Check for missing structured-configuration extensions
+    # Re-read extensions in case the C++ migration updated them
+    current_exts = current_exts + missing_cpp
+    missing_config = [ext for ext in CONFIG_EXTENSIONS if ext not in current_exts]
+    if missing_config:
+        migrations.append({
+            "field": "indexing.file_extensions",
+            "action": "update" if current_exts else "add",
+            "reason": (
+                f"Structured configuration support: add {', '.join(missing_config)}. "
+                "YAML is chunked by indentation and .tpl by Helm define blocks, "
+                "so charts and manifests are searchable by key path."
+            ),
+            "old_value": current_exts if current_exts else None,
+            "new_value": current_exts + missing_config,
         })
 
     # Check for missing max_office_file_size_kb (Phase 9)

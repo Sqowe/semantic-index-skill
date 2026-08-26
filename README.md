@@ -680,6 +680,17 @@ cannot parse the file, the C++ grammar is tried and the better fit wins.
 A C++ header named `.h` is therefore chunked as C++, while a genuine C
 header is never re-parsed.
 
+Structured configuration is chunked by its own shape rather than by blank lines:
+
+| Format | Extensions | How it is split |
+|--------|-----------|-----------------|
+| YAML | `.yaml`, `.yml` | Documents at `---`, then top-level keys, then recursively into any key still over budget. Nested chunks carry their key path (`spec.template.spec.containers[].env`). |
+| Helm template | `.tpl` | One chunk per `{{ define }}` block, named by the template it defines. |
+
+YAML is read as text, not parsed. Helm charts are Go templates that are not
+valid YAML until rendered, and they are the bulk of the `.yaml` in most
+repositories, so a real parser would reject the files that need this most.
+
 DITA XML documentation is also supported with XML-aware chunking:
 
 | Language | Extensions | Key constructs extracted |

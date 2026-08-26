@@ -71,7 +71,8 @@ semantic-index/                     # SKILL root (installed to ~/.kiro/skills/)
 │   └── lib/                        # Python package
 │       ├── models.py config.py hasher.py   # Core: data, config, change detection
 │       ├── chunker.py              # Dispatch + fallback
-│       ├── chunkers/               # code.py markdown.py dita.py office.py common.py
+│       ├── chunkers/               # code.py markdown.py dita.py office.py
+│       │                          # yaml_config.py helm_template.py common.py
 │       ├── embedder.py             # Provider ABC, factory, cache
 │       ├── providers/              # openrouter.py huggingface.py
 │       ├── store.py bm25.py        # Storage: vector + keyword
@@ -91,7 +92,7 @@ including `hasher.py` and `migrate_config.py`, without pulling in heavy optional
 
 ### 4.1 Chunking Pipeline (`lib/chunkers/`)
 
-Five strategies dispatched by file extension via `chunker.py`:
+Seven strategies dispatched by file extension via `chunker.py`:
 
 | Strategy | Module | Formats | Method |
 |----------|--------|---------|--------|
@@ -99,6 +100,8 @@ Five strategies dispatched by file extension via `chunker.py`:
 | Markdown | `markdown.py` | .md .mdx .rst | Header-based section splitting |
 | DITA | `dita.py` | .dita .ditamap | XML topic-based parsing |
 | Office | `office.py` | .pdf .docx .pptx | Page/heading/slide-based (binary I/O) |
+| YAML | `yaml_config.py` | .yaml .yml | Indentation-aware, recursive by key path |
+| Helm | `helm_template.py` | .tpl | One chunk per named `define` block |
 | Fallback | `chunker.py` | everything else | Blank-line splitting |
 
 ### 4.2 Embedding System (`lib/embedder.py` + `lib/providers/`)

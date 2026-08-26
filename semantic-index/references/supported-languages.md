@@ -167,6 +167,61 @@ never re-parsed, so the retry costs nothing for every other language.
 
 ---
 
+## Structured Configuration (YAML, Helm templates)
+
+YAML keeps its structure in indentation, not in blank lines, and most of it
+has almost no blank lines at all — across one estate of Helm charts and
+Kubernetes manifests the median file was 2.6% blank. The generic fallback
+therefore cut such files at arbitrary token boundaries, mid-key and
+sometimes mid-word.
+
+### YAML (`.yaml`, `.yml`) — `chunkers/yaml_config.py`
+
+1. The file is divided at `---` into documents. With more than one, each
+   chunk records `doc_index`.
+2. Each document is divided into its top-level keys.
+3. Any key whose block is still over budget is divided again into its own
+   children, as deep as needed, capped by `MAX_SPLIT_DEPTH`.
+4. Consecutive small keys are grouped together up to the budget.
+
+A chunk that is not a whole top-level key gets a breadcrumb comment naming
+where it came from, and the same path in `metadata["key_path"]` and in
+`symbol_name`:
+
+```yaml
+# spec.template.spec.containers[].env
+            - name: LOG_LEVEL
+              value: info
+```
+
+Sequence steps render as `[]`. Because of the breadcrumb, a nested chunk's
+text is not byte-identical to the file; `start_line` still points at the
+first real line.
+
+Nothing here parses YAML. Helm charts are Go templates that are not valid
+YAML until rendered, and they are most of the `.yaml` in a typical
+repository, so a parser would reject the files that need this most. One
+consequence is worth knowing: a template directive such as
+`{{- include "chart.labels" . | nindent 4 }}` is written flush left however
+deep the content it stands for, so its indentation is ignored when working
+out the structure.
+
+Content inside a block scalar (`config: |`) holding embedded XML, CSV or
+JSON has no YAML structure left to split on, and falls back to token
+boundaries.
+
+### Helm template libraries (`.tpl`) — `chunkers/helm_template.py`
+
+A `.tpl` file is a library of named templates. Each `{{ define "name" }}`
+block becomes one chunk, named by the template it defines — the name lands
+in both `symbol_name` and `metadata["template_name"]`. Nesting of `if`,
+`range`, `with` and `block` is tracked so the `{{ end }}` closing a
+conditional is not mistaken for the one closing the definition. Text
+outside any definition becomes a `module_level` chunk, and an unterminated
+definition runs to the end of the file.
+
+---
+
 ## DITA XML Documentation
 
 DITA (Darwin Information Typing Architecture) files use XML-aware chunking
@@ -281,6 +336,8 @@ optional — install via `bash setup.sh --with-office`.
 | `.rb` | Ruby | Tree-sitter AST |
 | `.php` | PHP | Tree-sitter AST |
 | `.md`, `.mdx` | Markdown | Header-based |
+| `.yaml`, `.yml` | YAML | Indentation-aware, by key path |
+| `.tpl` | Helm template | One chunk per `define` block |
 | `.dita` | DITA XML | XML topic-based |
 | `.ditamap` | DITA Map | XML topicref-based |
 | `.pdf` | PDF | Page-based extraction |
