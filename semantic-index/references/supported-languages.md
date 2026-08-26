@@ -90,7 +90,7 @@ Languages without a Tree-sitter grammar fall back to blank-line splitting.
 | Top-level nodes | `function_definition`, `struct_specifier`, `enum_specifier`, `type_definition`, `declaration` |
 | Method nodes | None (C has no classes) |
 | Body node types | N/A |
-| Notes | C has no class/method concept. All functions are top-level. `struct_specifier` and `enum_specifier` capture type definitions. `declaration` catches global variables and function prototypes. |
+| Notes | C has no class/method concept. All functions are top-level. `struct_specifier` and `enum_specifier` capture type definitions. `declaration` catches global variables and function prototypes. A `.h` file that the C grammar cannot parse is re-parsed with the C++ grammar and chunked as C++ — see *Grammar fallback* below. |
 
 ### C++
 
@@ -138,6 +138,32 @@ blank-line-based splitting. The fallback:
 
 This produces reasonable chunks for prose and configuration files but lacks
 the semantic precision of AST-aware splitting.
+
+### Grammar fallback
+
+A file extension does not always settle which grammar fits. A `.h` file
+holds C in a C project and C++ in a C++ one, and both reach the chunker
+as C. Deciding from the extension gets one of the two wrong: measured on
+one C++ codebase, the C grammar failed to parse 98% of its `.h` files
+where the C++ grammar failed on 3%.
+
+So the file decides, not its name. The grammar named by the extension is
+tried first; only if that parse comes back with errors is an alternate
+tried. The first alternate that parses cleanly wins, and if none does,
+the one with the fewest error nodes wins. A file that no grammar can
+handle keeps the original grammar and behaves exactly as before.
+
+The winning grammar is then used throughout — node types, symbol
+extraction, and the `language` field recorded on each chunk. A C++ header
+named `.h` therefore produces chunks tagged `cpp`.
+
+| Declared language | Alternates tried |
+|-------------------|------------------|
+| `c` | `cpp` |
+
+Alternates are declared in `GRAMMAR_ALTERNATES` in
+`scripts/lib/chunkers/code.py`. A language absent from that table is
+never re-parsed, so the retry costs nothing for every other language.
 
 ---
 
@@ -250,7 +276,7 @@ optional — install via `bash setup.sh --with-office`.
 | `.go` | Go | Tree-sitter AST |
 | `.rs` | Rust | Tree-sitter AST |
 | `.java` | Java | Tree-sitter AST |
-| `.c`, `.h` | C | Tree-sitter AST |
+| `.c`, `.h` | C | Tree-sitter AST (`.h` falls back to C++, see below) |
 | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` | C++ | Tree-sitter AST |
 | `.rb` | Ruby | Tree-sitter AST |
 | `.php` | PHP | Tree-sitter AST |

@@ -674,6 +674,12 @@ AST-aware chunking via Tree-sitter is available for 10 languages:
 | Ruby | `.rb` | modules, classes, methods |
 | PHP | `.php` | classes, functions, methods |
 
+A `.h` file holds C in a C project and C++ in a C++ one, so the extension
+cannot settle which grammar to use. The C grammar is tried first; if it
+cannot parse the file, the C++ grammar is tried and the better fit wins.
+A C++ header named `.h` is therefore chunked as C++, while a genuine C
+header is never re-parsed.
+
 DITA XML documentation is also supported with XML-aware chunking:
 
 | Language | Extensions | Key constructs extracted |

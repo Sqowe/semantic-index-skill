@@ -1066,3 +1066,110 @@ class TestGrammarFallback:
         )
         combined = " ".join(c.content for c in chunks)
         assert "hello" in combined
+
+
+class TestGrammarAlternates:
+    """Verify a file is parsed with the grammar that actually fits it.
+
+    A ``.h`` extension maps to C, but in a C++ project those headers hold
+    classes, namespaces and templates. When the declared grammar cannot
+    parse the file, an alternate is tried and the better fit is used.
+    """
+
+    CPP_HEADER = (
+        "#pragma once\n"
+        "#include <string>\n\n"
+        "namespace Telemetry {\n\n"
+        "template <typename T>\n"
+        "class SessionStore {\n"
+        "public:\n"
+        "    explicit SessionStore(std::string name) : name_(std::move(name)) {}\n\n"
+        "    void insert(const T& value) {\n"
+        "        entries_.push_back(value);\n"
+        "    }\n\n"
+        "    std::size_t size() const noexcept { return entries_.size(); }\n\n"
+        "private:\n"
+        "    std::string name_;\n"
+        "    std::vector<T> entries_;\n"
+        "};\n\n"
+        "}  // namespace Telemetry\n"
+    )
+
+    PLAIN_C_HEADER = (
+        "#ifndef SESSION_H\n"
+        "#define SESSION_H\n\n"
+        "struct session {\n"
+        "    int id;\n"
+        "    char name[64];\n"
+        "};\n\n"
+        "int session_open(struct session *s, int id);\n"
+        "void session_close(struct session *s);\n\n"
+        "#endif\n"
+    )
+
+    def test_cpp_header_declared_as_c_uses_cpp_grammar(self, default_config) -> None:
+        """A C++ header reaching the chunker as C is re-parsed as C++."""
+        chunks = chunk_code_with_treesitter(
+            self.CPP_HEADER, "session_store.h", "c", default_config,
+        )
+        assert chunks
+        assert all(c.language == "cpp" for c in chunks), (
+            f"expected cpp, got {sorted({c.language for c in chunks})}"
+        )
+
+    def test_cpp_header_yields_structure(self, default_config) -> None:
+        """The re-parse must produce real code structure, not text blocks."""
+        chunks = chunk_code_with_treesitter(
+            self.CPP_HEADER, "session_store.h", "c", default_config,
+        )
+        assert any(c.chunk_type != ChunkType.UNKNOWN for c in chunks)
+        assert any(c.symbol_name for c in chunks)
+
+    def test_plain_c_header_stays_c(self, default_config) -> None:
+        """A header the C grammar parses cleanly is never re-parsed."""
+        chunks = chunk_code_with_treesitter(
+            self.PLAIN_C_HEADER, "session.h", "c", default_config,
+        )
+        assert chunks
+        assert all(c.language == "c" for c in chunks)
+
+    def test_language_without_alternates_is_untouched(self, default_config) -> None:
+        """Unparseable input in a language with no alternates keeps its language."""
+        chunks = chunk_code_with_treesitter(
+            "def broken(:\n    ???\n", "broken.py", "python", default_config,
+        )
+        assert all(c.language == "python" for c in chunks)
+
+
+class TestParseErrorCounting:
+    """Verify the tie-break used when no candidate grammar parses cleanly."""
+
+    def test_clean_tree_has_no_errors(self) -> None:
+        from lib.chunkers.code import _count_parse_errors
+
+        parser = _get_parser("c")
+        if parser is None:
+            pytest.skip("tree-sitter-c not installed")
+        tree = parser.parse(b"int add(int a, int b) { return a + b; }\n")
+        assert _count_parse_errors(tree.root_node) == 0
+
+    def test_broken_tree_reports_errors(self) -> None:
+        from lib.chunkers.code import _count_parse_errors
+
+        parser = _get_parser("c")
+        if parser is None:
+            pytest.skip("tree-sitter-c not installed")
+        tree = parser.parse(b"int add(int a, { ) return @@@ ;\n")
+        assert _count_parse_errors(tree.root_node) > 0
+
+    def test_cpp_beats_c_on_a_cpp_header(self) -> None:
+        """The metric must prefer C++ for content only C++ can parse."""
+        from lib.chunkers.code import _count_parse_errors
+
+        c_parser, cpp_parser = _get_parser("c"), _get_parser("cpp")
+        if c_parser is None or cpp_parser is None:
+            pytest.skip("C/C++ grammars not installed")
+        source = TestGrammarAlternates.CPP_HEADER.encode("utf-8")
+        c_errors = _count_parse_errors(c_parser.parse(source).root_node)
+        cpp_errors = _count_parse_errors(cpp_parser.parse(source).root_node)
+        assert cpp_errors < c_errors

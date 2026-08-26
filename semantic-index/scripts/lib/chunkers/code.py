@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded parsers cache
 _parsers: dict[str, object] = {}
 
+# Grammars to try when the one picked from the file extension cannot parse
+# the file cleanly.
+#
+# An extension does not always settle which grammar fits. A ".h" holds C in
+# a C project and C++ in a C++ one, and both arrive here as "c". Guessing
+# from the extension gets one of the two wrong: measured on one C++
+# codebase, the C grammar failed to parse 98% of its ".h" files where the
+# C++ grammar failed on 3%. Guessing from the content is no better — the
+# markers that distinguish the two (``class``, ``namespace``, ``template``)
+# appear inside comments and string literals as well.
+#
+# So the file itself decides. The declared grammar is tried first and an
+# alternate is consulted only when that parse comes back with errors, which
+# means a project whose headers really are C pays nothing.
+GRAMMAR_ALTERNATES: dict[str, tuple[str, ...]] = {
+    "c": ("cpp",),
+}
+
 # Node types treated as class-like containers for oversized splitting.
 # Shared between chunk_code_with_treesitter (is_class) and _node_to_chunk_type
 # to prevent drift.
@@ -311,6 +329,85 @@ def _get_parser(language: str):
     return parser
 
 
+def _count_parse_errors(root) -> int:
+    """Count the ERROR and MISSING nodes in a parse tree.
+
+    Used to compare two candidate grammars when neither parses a file
+    cleanly, so the closer fit still wins. Subtrees that parsed without
+    errors are pruned via ``has_error``, so the walk only descends into
+    the parts of the tree that actually went wrong.
+
+    Args:
+        root: Root node of a Tree-sitter parse tree.
+
+    Returns:
+        The number of error and missing nodes.
+    """
+    total = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if not node.has_error:
+            continue
+        if node.type == "ERROR" or node.is_missing:
+            total += 1
+        stack.extend(node.children)
+    return total
+
+
+def _parse_with_best_grammar(source_bytes: bytes, language: str):
+    """Parse *source_bytes*, retrying with an alternate grammar on failure.
+
+    The grammar named by the file extension is tried first. If it parses
+    cleanly — the common case — nothing else happens and the cost is one
+    parse. Only when it reports errors are the alternates in
+    :data:`GRAMMAR_ALTERNATES` tried: the first one to parse cleanly wins,
+    and if none does, the one with the fewest errors wins. A file no
+    grammar can handle keeps the declared grammar's tree, so behaviour is
+    unchanged from before this fallback existed.
+
+    Args:
+        source_bytes: The file's UTF-8 encoded content.
+        language: Language identifier detected from the file extension.
+
+    Returns:
+        A ``(tree, language)`` pair, where the language is the grammar that
+        actually produced the tree. Callers must use the returned language
+        for node-type lookups and symbol extraction, not the one they
+        passed in. Returns ``(None, language)`` when no parser is available.
+    """
+    parser = _get_parser(language)
+    if parser is None:
+        return None, language
+
+    tree = parser.parse(source_bytes)
+    if not tree.root_node.has_error:
+        return tree, language
+
+    best_tree = tree
+    best_language = language
+    # Counted only if some alternate also fails and the two need comparing.
+    # Walking a badly broken tree is far more expensive than parsing, and
+    # the usual outcome is an alternate that parses cleanly, so this stays
+    # unpaid in the common case.
+    best_errors: Optional[int] = None
+
+    for alternate in GRAMMAR_ALTERNATES.get(language, ()):
+        alt_parser = _get_parser(alternate)
+        if alt_parser is None:
+            continue
+        alt_tree = alt_parser.parse(source_bytes)
+        if not alt_tree.root_node.has_error:
+            return alt_tree, alternate
+        if best_errors is None:
+            best_errors = _count_parse_errors(best_tree.root_node)
+        alt_errors = _count_parse_errors(alt_tree.root_node)
+        if alt_errors < best_errors:
+            best_tree, best_language, best_errors = alt_tree, alternate, alt_errors
+
+    return best_tree, best_language
+
+
 def _extract_symbol_name(node, language: str) -> Optional[str]:
     """Extract the name of a function/class/method from an AST node."""
     # For decorated definitions (Python), look at the inner definition
@@ -544,10 +641,18 @@ def chunk_code_with_treesitter(
 
     Falls back to text splitting if Tree-sitter is unavailable.
 
+    *language* is what the file extension suggests, which is not always
+    what the file contains — a ``.h`` arrives here as C whether it holds C
+    or C++. When that grammar cannot parse the file cleanly, the
+    alternates in :data:`GRAMMAR_ALTERNATES` are tried and the best fit is
+    used instead, for node types, symbol extraction and the language
+    recorded on each chunk alike.
+
     Args:
         content: File text.
         file_path: Project-relative path.
-        language: Detected language.
+        language: Language detected from the file extension. Treated as a
+            starting point, not a verdict — see above.
         config: Loaded configuration.
         tokens: Tokenizer wrapper. Defaults to the chunkers.common
             resolver's tiktoken fallback.
@@ -557,14 +662,21 @@ def chunk_code_with_treesitter(
     def count_tokens(text: str) -> int:
         return _base_count_tokens(text, tokens=tokens)
 
-    parser = _get_parser(language)
-    if parser is None:
+    source_bytes = content.encode("utf-8")
+    tree, grammar = _parse_with_best_grammar(source_bytes, language)
+    if tree is None:
         return chunk_text_fallback(
             content, file_path, language, config, tokens=tokens,
         )
-
-    source_bytes = content.encode("utf-8")
-    tree = parser.parse(source_bytes)
+    if grammar != language:
+        logger.debug(
+            "%s parses cleaner as %s than as %s; using the %s grammar",
+            file_path, grammar, language, grammar,
+        )
+        # Everything below keys off the grammar that actually parsed the
+        # file: node types, symbol extraction, and the language recorded
+        # on each chunk.
+        language = grammar
     root = tree.root_node
 
     max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
