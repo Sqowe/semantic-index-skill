@@ -108,7 +108,7 @@ Seven strategies dispatched by file extension via `chunker.py`:
 
 Provider pattern with lazy imports. Factory selects provider from config.
 `openrouter.py` — REST API with batching + retry. `huggingface.py` — local inference, auto device detection.
-Embedding cache (`embedding_cache.json`) sits above the provider layer.
+Embedding cache (`embedding_cache.db`, SQLite) sits above the provider layer.
 Both providers produce identical vectors for the same model — indexes are cross-compatible.
 
 ### 4.3 Search & Retrieval
@@ -181,7 +181,7 @@ Defaults (`assets/default-config.json`) → `.index/config.json` (per-project) �
 <project-root>/.index/
 ├── config.json            # User config (created on first run)
 ├── manifest.json          # SHA-256 file hash manifest
-├── embedding_cache.json   # Content hash → vector cache
+├── embedding_cache.db     # Content hash → vector cache (SQLite)
 ├── bm25_index.json        # BM25 keyword index
 └── lancedb/chunks.lance/  # LanceDB vector store (Arrow format)
 ```

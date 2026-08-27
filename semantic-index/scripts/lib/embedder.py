@@ -9,7 +9,6 @@ providing the same public API used by build_index.py and semantic_search.py.
 """
 
 import hashlib
-import json
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
@@ -17,13 +16,13 @@ from pathlib import Path
 from typing import Optional
 
 from .chunkers.common import count_tokens, hard_split_by_tokens
-from .config import Config, INDEX_DIR_NAME
+from .config import Config
+from .embedding_cache import EmbeddingCache
 from .models import Chunk, EmbeddingError, TruncationRecord
 from .tokenizer_resolver import TokenizerWrapper, resolver_for_config
 
 logger = logging.getLogger(__name__)
 
-CACHE_FILENAME = "embedding_cache.json"
 
 # Margin kept inside ``max_embed_tokens`` whenever the Embedder pre-truncates
 # a chunk. The provider (and the API) count tokens with their own tokenizer;
@@ -114,70 +113,6 @@ def create_embedder(config: Config) -> EmbeddingProvider:
         stacklevel=2,
     )
     return create_provider(config)
-
-
-# ---------------------------------------------------------------------------
-# Embedding cache
-# ---------------------------------------------------------------------------
-
-class EmbeddingCache:
-    """On-disk cache mapping content hashes to embedding vectors.
-
-    The cache is invalidated if the model or dimensions change.
-    """
-
-    def __init__(self, project_dir: str, config: Config) -> None:
-        self._path = Path(project_dir) / INDEX_DIR_NAME / CACHE_FILENAME
-        self._model = config.embedding.model
-        self._dimensions = config.embedding.dimensions
-        self._entries: dict[str, list[float]] = {}
-        self._dirty = False
-        self._load()
-
-    def _load(self) -> None:
-        if not self._path.exists():
-            return
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Cache unreadable, starting fresh: %s", exc)
-            return
-
-        # Invalidate if model or dimensions changed
-        if raw.get("model") != self._model or raw.get("dimensions") != self._dimensions:
-            logger.info(
-                "Cache model/dimensions mismatch (cached: %s/%s, current: %s/%s), clearing",
-                raw.get("model"), raw.get("dimensions"),
-                self._model, self._dimensions,
-            )
-            return
-        self._entries = raw.get("entries", {})
-        logger.info("Loaded %d cached embeddings", len(self._entries))
-
-    def has(self, content_hash: str) -> bool:
-        return content_hash in self._entries
-
-    def get(self, content_hash: str) -> Optional[list[float]]:
-        return self._entries.get(content_hash)
-
-    def set(self, content_hash: str, vector: list[float]) -> None:
-        self._entries[content_hash] = vector
-        self._dirty = True
-
-    def save(self) -> None:
-        """Persist cache to disk if modified."""
-        if not self._dirty:
-            return
-        data = {
-            "version": "1.0",
-            "model": self._model,
-            "dimensions": self._dimensions,
-            "entries": self._entries,
-        }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(data) + "\n", encoding="utf-8")
-        logger.info("Saved %d embeddings to cache", len(self._entries))
-        self._dirty = False
 
 
 # ---------------------------------------------------------------------------
