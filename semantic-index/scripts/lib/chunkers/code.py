@@ -838,6 +838,43 @@ def _chunk_class_node(
     method_ranges: list[tuple[int, int]] = []
 
     for child in body_node.children:
+        # A container nested directly inside this one. C++ in particular is
+        # written as ``namespace A { namespace B { ... } }``, so the
+        # functions are two levels down and a scan of this body alone finds
+        # nothing — leaving the whole outer namespace as one chunk. Descend
+        # so the definitions inside are reached.
+        if child is not body_node and (
+            child.type in CLASS_LIKE_NODES or "class" in child.type
+        ):
+            nested_text = source_bytes[child.start_byte:child.end_byte].decode(
+                "utf-8", errors="replace",
+            )
+            nested_name = _extract_symbol_name(child, language)
+            if count_tokens(nested_text) > max_tokens:
+                nested_chunks = _chunk_class_node(
+                    child, source_bytes, file_path, language, nested_name,
+                    config, tokens, max_tokens,
+                )
+                if nested_chunks:
+                    chunks.extend(nested_chunks)
+                    method_ranges.append((child.start_byte, child.end_byte))
+                    continue
+            elif count_tokens(nested_text) >= min_tokens:
+                chunks.append(Chunk(
+                    id=make_chunk_id(file_path, nested_text, child.start_point[0] + 1),
+                    file_path=file_path,
+                    start_line=child.start_point[0] + 1,
+                    end_line=child.end_point[0] + 1,
+                    content=nested_text,
+                    chunk_type=_node_to_chunk_type(child.type),
+                    language=language,
+                    symbol_name=nested_name,
+                    token_count=count_tokens(nested_text),
+                    metadata={"parent_class": class_name} if class_name else {},
+                ))
+                method_ranges.append((child.start_byte, child.end_byte))
+                continue
+
         # Handle decorated methods in Python:
         # Check the inner node type for method matching,
         # but use the outer decorated_definition range for content extraction.
@@ -905,7 +942,9 @@ def _chunk_class_node(
     if sig_parts:
         sig_text = "\n".join(sig_parts)
         tc = count_tokens(sig_text)
-        if tc >= min_tokens:
+        if tc < min_tokens:
+            pass
+        elif tc <= max_tokens:
             chunks.insert(0, Chunk(
                 id=make_chunk_id(file_path, sig_text, class_node.start_point[0] + 1),
                 file_path=file_path,
@@ -918,5 +957,17 @@ def _chunk_class_node(
                 token_count=tc,
                 metadata={},
             ))
+        else:
+            # When no method or nested container was found, "everything not
+            # covered by a method" is the whole class. Emitting that
+            # unchecked hands the caller an over-budget chunk which it
+            # trusts, and the dispatch-level safety net then cuts it at
+            # token boundaries — losing the line numbers, which collapse to
+            # the chunk's first line. Split it here instead, where the
+            # blank-line boundaries are still available.
+            chunks[0:0] = _split_oversized_chunk(
+                sig_text, file_path, class_node.start_point[0] + 1, language,
+                ChunkType.CLASS, class_name, max_tokens, min_tokens, {}, tokens,
+            )
 
     return chunks

@@ -94,16 +94,22 @@ def hard_split_by_tokens(
       character; a round-trip check (``encode(decode(slice)) == slice``)
       catches it and shrinks the window.
 
-    * Drift across consecutive windows (SentencePiece-style tokenizers
-      like BAAI/bge-m3). The leading-space marker token that SentencePiece
-      prepends on the *first* encode is not reproduced when a decoded
-      substring is re-encoded, so successive slices systematically fail
-      the round-trip check. The check is therefore skipped for real
-      tokenizers — they never split mid-character, so corruption is not
-      the concern — and the produced pieces are *approximate*: a 60-token
-      slice may re-encode to 61 or 62 tokens. ``_enforce_token_budget``
-      catches and re-splits any such over-budget pieces, so the net
-      guarantee still holds.
+    * Text loss (SentencePiece-style tokenizers like BAAI/bge-m3).
+      ``decode(encode(x))`` does not return ``x``: runs of whitespace
+      collapse, newlines and tabs become single spaces, and a word
+      boundary marked only by whitespace can vanish. Rebuilding pieces
+      that way would store text in the index that does not match the
+      file, and would flatten every piece onto one line number, since
+      line numbers downstream are counted from the newlines in the
+      piece. So for real tokenizers the split uses the character
+      offsets the tokenizer reports for each token and cuts the
+      *original string*, which concatenates back to the input exactly.
+
+      Those pieces are still *approximate* in size — a window carries
+      the whitespace before its first token, which re-encodes as an
+      extra token or two, so a 512-token window may measure 515.
+      Measured overshoot at production budgets is under 1%, inside the
+      rounding margin ``_enforce_token_budget`` already allows.
 
     Args:
         text: The text to split.
@@ -123,9 +129,37 @@ def hard_split_by_tokens(
     if len(token_ids) <= max_tokens:
         return [text]
 
-    # Only BPE-style tokenizers (tiktoken) need the round-trip check.
-    # SentencePiece-style real tokenizers are safe and the check would
-    # make every window shrink to almost nothing.
+    # Real tokenizers report where each token came from in the source.
+    # Cutting the original string at those offsets is the only split that
+    # returns the text unchanged: for a SentencePiece-style tokenizer
+    # ``decode(encode(x))`` collapses runs of whitespace, turns newlines
+    # into spaces, and can erase a word boundary altogether. Feeding that
+    # into the index would store text that does not match the file, and
+    # would flatten every piece onto one line number, because line
+    # numbers downstream are counted from the newlines in the piece.
+    offsets = wrapper.offsets(text)
+    if offsets is not None and len(offsets) == len(token_ids):
+        pieces = []
+        cursor = 0
+        i = 0
+        while i < len(token_ids):
+            end = min(i + max_tokens, len(token_ids))
+            # Cut at the end of the last token in the window, and let the
+            # final window run to the end of the text, so the pieces
+            # concatenate back to exactly the input.
+            char_end = len(text) if end >= len(token_ids) else offsets[end - 1][1]
+            if char_end <= cursor:
+                # A zero-width token span would make no progress.
+                char_end = min(len(text), cursor + 1)
+            piece = text[cursor:char_end]
+            if piece:
+                pieces.append(piece)
+            cursor = char_end
+            i = end
+        return pieces if pieces else [text]
+
+    # tiktoken: no offsets, but decoding round-trips exactly. The check
+    # below catches the one failure mode, a slice ending mid-byte.
     do_round_trip = wrapper.kind != "real"
 
     pieces: list[str] = []

@@ -22,6 +22,19 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 
+# How many times a single request will wait out an HTTP 429 before giving
+# up, and the ceiling on the backoff between those waits.
+#
+# These are separate from ``embedding.max_retries``, which governs failed
+# requests. Rate limiting is a property of the provider and the moment,
+# not of the project's content, so it is tuned here rather than in the
+# project config. Eight waits backing off 1, 2, 4, 8, 16, 32, 60, 60
+# seconds is about three minutes of patience — long enough to ride out a
+# burst on a bulk build, short enough to fail visibly if the account is
+# genuinely throttled. A ``Retry-After`` header always wins over this.
+MAX_RATE_LIMIT_WAITS = 8
+MAX_RATE_LIMIT_DELAY_SECONDS = 60.0
+
 # Token margin kept inside ``max_embed_tokens`` whenever we truncate. The
 # embedding API counts tokens with its own tokenizer; ours is at best the
 # same model (so the count matches exactly) and at worst tiktoken cl100k
@@ -103,8 +116,15 @@ class OpenRouterProvider:
             body["dimensions"] = self._dimensions
 
         last_error: Optional[Exception] = None
+        # Transport failures and rate limits are counted separately. A 429
+        # is not a failure — it is the server saying "wait" — so spending
+        # the error budget on it means three rate-limit responses in a row
+        # end a build no matter how healthy the connection is. On a job
+        # embedding tens of thousands of chunks that happens routinely.
+        attempt = 0
+        rate_limit_waits = 0
 
-        for attempt in range(self._max_retries):
+        while attempt < self._max_retries:
             try:
                 resp = requests.post(
                     OPENROUTER_EMBEDDINGS_URL,
@@ -163,7 +183,10 @@ class OpenRouterProvider:
 
                 # Handle rate limiting
                 if resp.status_code == 429:
-                    fallback_delay = self._retry_delay * (2 ** attempt)
+                    fallback_delay = min(
+                        self._retry_delay * (2 ** rate_limit_waits),
+                        MAX_RATE_LIMIT_DELAY_SECONDS,
+                    )
                     raw_retry = resp.headers.get("Retry-After")
                     try:
                         retry_after = float(raw_retry) if raw_retry else fallback_delay
@@ -179,8 +202,24 @@ class OpenRouterProvider:
                             retry_after, fallback_delay,
                         )
                         retry_after = fallback_delay
-                    logger.warning("Rate limited, retrying in %.1fs", retry_after)
+                    rate_limit_waits += 1
+                    last_error = EmbeddingError(
+                        f"rate limited by the API {rate_limit_waits} time(s) "
+                        f"in a row (HTTP 429)"
+                    )
+                    if rate_limit_waits > MAX_RATE_LIMIT_WAITS:
+                        logger.error(
+                            "Still rate limited after %d waits; giving up on "
+                            "this batch", MAX_RATE_LIMIT_WAITS,
+                        )
+                        break
+                    logger.warning(
+                        "Rate limited (wait %d/%d), retrying in %.1fs",
+                        rate_limit_waits, MAX_RATE_LIMIT_WAITS, retry_after,
+                    )
                     time.sleep(retry_after)
+                    # Deliberately does not advance ``attempt``: waiting out
+                    # a rate limit is not a failed attempt.
                     continue
 
                 resp.raise_for_status()
@@ -254,16 +293,18 @@ class OpenRouterProvider:
 
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt < self._max_retries - 1:
-                    delay = self._retry_delay * (2 ** attempt)
+                delay = self._retry_delay * (2 ** attempt)
+                attempt += 1
+                if attempt < self._max_retries:
                     logger.warning(
                         "API call failed (attempt %d/%d), retrying in %.1fs: %s",
-                        attempt + 1, self._max_retries, delay, exc,
+                        attempt, self._max_retries, delay, exc,
                     )
                     time.sleep(delay)
 
         raise EmbeddingError(
-            f"Embedding API failed after {self._max_retries} retries: {last_error}"
+            f"Embedding API failed after {attempt} attempt(s) and "
+            f"{rate_limit_waits} rate-limit wait(s): {last_error}"
         )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:

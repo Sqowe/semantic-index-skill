@@ -72,8 +72,34 @@ class TokenizerWrapper:
         return self._inner.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        """Decode a list of token ids back to text."""
+        """Decode a list of token ids back to text.
+
+        For real (SentencePiece-style) tokenizers this is **lossy**:
+        runs of whitespace collapse, newlines and tabs become single
+        spaces, and a word boundary marked only by whitespace can
+        disappear. Never use it to reconstruct source text — see
+        :meth:`offsets`.
+        """
         return self._inner.decode(ids)
+
+    def offsets(self, text: str) -> Optional[list[tuple[int, int]]]:
+        """Character spans of each token in *text*, or None if unavailable.
+
+        Real tokenizers report where every token came from, which lets a
+        caller cut the original string at token boundaries instead of
+        decoding token ids back into text. That is the only way to split
+        without altering the source: ``decode(encode(x))`` does not
+        return ``x`` for a SentencePiece-style tokenizer.
+
+        tiktoken has no equivalent, and needs none — it round-trips
+        exactly — so it returns None and callers keep the decode path.
+        """
+        if self._kind != "real":
+            return None
+        try:
+            return list(self._inner.encode(text).offsets)
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     @property
     def kind(self) -> str:

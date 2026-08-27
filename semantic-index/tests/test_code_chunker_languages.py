@@ -1173,3 +1173,61 @@ class TestParseErrorCounting:
         c_errors = _count_parse_errors(c_parser.parse(source).root_node)
         cpp_errors = _count_parse_errors(cpp_parser.parse(source).root_node)
         assert cpp_errors < c_errors
+
+
+class TestNestedContainerSplitting:
+    """A class-like node must never leave an over-budget chunk behind.
+
+    C++ is written as ``namespace A { namespace B { ... } }``, so a scan of
+    the outer body alone finds no functions. The signature fallback then
+    took "everything not covered by a method" — the whole namespace — and
+    emitted it unchecked. The caller trusted it, and the dispatch-level
+    safety net cut it at token boundaries, losing the line numbers.
+    """
+
+    NESTED_NAMESPACES = (
+        "#include <vector>\n\n"
+        "namespace Telemetry {\n"
+        "namespace Session {\n\n"
+        + "".join(
+            f"void handler{i}(const Event& e) {{\n"
+            f"    store_.record(e, {i});\n"
+            f"    logger_.debug(\"handled event {i} for session\", e.id());\n"
+            f"}}\n\n"
+            for i in range(14)
+        )
+        + "}  // namespace Session\n"
+        "}  // namespace Telemetry\n"
+    )
+
+    def test_no_chunk_exceeds_the_budget(self, small_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            self.NESTED_NAMESPACES, "store.cc", "cpp", small_config,
+        )
+        assert chunks
+        for chunk in chunks:
+            assert chunk.token_count <= small_config.chunking.max_tokens * 1.25, (
+                f"{chunk.chunk_type.value} at line {chunk.start_line} "
+                f"is {chunk.token_count} tokens"
+            )
+
+    def test_functions_inside_a_nested_namespace_are_found(self, small_config) -> None:
+        chunks = chunk_code_with_treesitter(
+            self.NESTED_NAMESPACES, "store.cc", "cpp", small_config,
+        )
+        names = [c.symbol_name for c in chunks if c.symbol_name]
+        assert "handler0" in names, names
+        assert "handler13" in names, names
+
+    def test_line_numbers_do_not_collapse(self, small_config) -> None:
+        """A multi-line chunk must report a multi-line range."""
+        chunks = chunk_code_with_treesitter(
+            self.NESTED_NAMESPACES, "store.cc", "cpp", small_config,
+        )
+        for chunk in chunks:
+            if chunk.content.count("\n") >= 2:
+                assert chunk.end_line > chunk.start_line, (
+                    f"chunk at line {chunk.start_line} spans "
+                    f"{chunk.content.count(chr(10))} newlines but reports "
+                    f"lines {chunk.start_line}-{chunk.end_line}"
+                )
