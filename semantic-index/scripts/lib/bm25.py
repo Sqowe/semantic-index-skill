@@ -243,28 +243,56 @@ class BM25Index:
     def delete_by_file(self, file_path: str) -> None:
         """Remove all documents belonging to a file from the index.
 
+        Prefer :meth:`delete_by_files` when removing more than one file —
+        see there for why.
+
         Args:
             file_path: Relative file path to remove.
         """
-        doc_ids_to_remove = [
+        self.delete_by_files([file_path])
+
+    def delete_by_files(self, file_paths: list[str]) -> None:
+        """Remove every document belonging to any of *file_paths*.
+
+        The work here is dominated by two full sweeps — one over the
+        documents to find which ones to drop, one over the inverted index
+        to strip them out of the postings. Both are the size of the whole
+        index, not of what is being removed, so doing them once per file
+        makes a bulk removal quadratic: deleting 1,672 files from a
+        200,000-document index meant 340 million document lookups and 328
+        million term visits, about 1.5 minutes, where one pass takes
+        milliseconds.
+
+        Args:
+            file_paths: Relative file paths to remove.
+        """
+        if not file_paths:
+            return
+
+        targets = set(file_paths)
+        doomed = {
             doc_id for doc_id, doc in self._docs.items()
-            if doc["file_path"] == file_path
-        ]
-        for doc_id in doc_ids_to_remove:
+            if doc["file_path"] in targets
+        }
+        if not doomed:
+            return
+
+        for doc_id in doomed:
             del self._docs[doc_id]
             del self._doc_lengths[doc_id]
 
-        # Clean postings
+        # One sweep of the inverted index for the whole removal.
         empty_terms: list[str] = []
         for term, postings in self._postings.items():
-            for doc_id in doc_ids_to_remove:
-                postings.pop(doc_id, None)
+            if doomed.isdisjoint(postings):
+                continue
+            for doc_id in doomed & postings.keys():
+                del postings[doc_id]
             if not postings:
                 empty_terms.append(term)
         for term in empty_terms:
             del self._postings[term]
 
-        # Recalculate stats
         self._n_docs = len(self._docs)
         total_length = sum(self._doc_lengths.values())
         self._avg_dl = total_length / self._n_docs if self._n_docs > 0 else 0.0

@@ -246,12 +246,20 @@ def main() -> None:
             del batch_chunks
 
         # --- Phase 2: handle deletions after all batches succeed ---
-        for file_path in changes.to_delete:
-            store.delete_by_file(file_path)
-            bm25.delete_by_file(file_path)
-            logger.info("Deleted chunks for removed file: %s", file_path)
+        # In one pass, not one per file: each store delete is its own
+        # transaction and each BM25 delete sweeps the whole inverted
+        # index, so removing files one at a time is quadratic in the size
+        # of the index rather than of the removal.
+        if changes.to_delete:
+            logger.info("Removing %d deleted files from the index...",
+                        len(changes.to_delete))
+            store.delete_by_files(changes.to_delete)
+            bm25.delete_by_files(changes.to_delete)
+            for file_path in changes.to_delete:
+                logger.debug("Deleted chunks for removed file: %s", file_path)
 
         # --- Phase 3: save BM25 index and update manifest ---
+        store.compact()
         bm25.save()
         update_manifest(args.project_dir, changes, chunk_counts)
 

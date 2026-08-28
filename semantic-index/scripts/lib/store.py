@@ -6,6 +6,8 @@ in .index/lancedb/. Supports add, search, delete, and stats operations.
 
 import logging
 import os
+import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,6 +28,36 @@ TABLE_NAME = "chunks"
 # floor guarantees a useful pool for tiny top_k; the cap bounds memory/latency.
 _GLOB_OVERFETCH_FLOOR = 200
 _GLOB_OVERFETCH_CAP = 2000
+
+# How many file paths go into a single delete predicate. Large enough that
+# the per-transaction cost is amortised away, small enough that the engine
+# is never handed a predicate with tens of thousands of terms.
+_DELETE_BATCH = 200
+
+# How much version history a build leaves behind. Anything older is
+# dropped at the end of a build; a window rather than zero so a search
+# running at that moment is not pulled out from under. Searches take
+# milliseconds, so minutes is already generous — and the window has to
+# stay well below how often builds run, or a build's own history is
+# always too young to clean and the table only ever grows.
+DEFAULT_VERSION_RETENTION = timedelta(minutes=10)
+
+
+def _sql_string(value: str) -> str:
+    """Quote *value* as a SQL string literal, escaping embedded quotes.
+
+    File paths are data, not code. A path containing an apostrophe would
+    otherwise end the literal early and change the meaning of the
+    predicate — on a delete, that is rows disappearing that should not.
+    """
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _batched(items: list[str], size: int):
+    """Yield *items* in consecutive lists of at most *size*."""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 def _build_schema(embedding_dim: int) -> pa.Schema:
@@ -125,28 +157,61 @@ class VectorStore:
     def delete_by_file(self, file_path: str) -> int:
         """Delete all chunks belonging to a specific file.
 
+        Prefer :meth:`delete_by_files` when removing more than one file —
+        each call here is a separate transaction, and the cost of a
+        transaction does not depend on how many rows it removes.
+
         Args:
             file_path: Relative file path to remove chunks for.
 
         Returns:
             Number of chunks deleted (approximate).
         """
+        return self.delete_by_files([file_path])
+
+    def delete_by_files(self, file_paths: list[str]) -> int:
+        """Delete all chunks belonging to any of *file_paths*.
+
+        Every ``table.delete()`` writes a version manifest, a deletion
+        file and a transaction record whatever it removes, and each one
+        is a durable write into directories that already hold every such
+        file from every previous build. Deleting a thousand files one at
+        a time therefore costs a thousand transactions: measured on a
+        200,000-row table, 224 ms per file against 2.2 ms when the same
+        files go out in batches of 100.
+
+        Paths go out in groups rather than one enormous predicate, so a
+        very large removal does not build a query string the engine has
+        to parse in one piece.
+
+        Args:
+            file_paths: Relative file paths to remove chunks for.
+
+        Returns:
+            Number of chunks deleted (approximate).
+        """
         table = self._get_table()
-        if table is None:
+        if table is None or not file_paths:
             return 0
 
-        try:
-            # Get count before deletion for logging
-            before = table.count_rows()
-            table.delete(f'file_path = "{file_path}"')
-            after = table.count_rows()
-            deleted = before - after
-            if deleted > 0:
-                logger.debug("Deleted %d chunks for file: %s", deleted, file_path)
-            return deleted
-        except Exception as exc:
-            logger.warning("Failed to delete chunks for %s: %s", file_path, exc)
-            return 0
+        before = table.count_rows()
+        for group in _batched(list(dict.fromkeys(file_paths)), _DELETE_BATCH):
+            predicate = "file_path IN ({})".format(
+                ", ".join(_sql_string(path) for path in group)
+            )
+            try:
+                table.delete(predicate)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to delete chunks for %d files (first: %s): %s",
+                    len(group), group[0], exc,
+                )
+        deleted = before - table.count_rows()
+        if deleted > 0:
+            logger.debug(
+                "Deleted %d chunks across %d files", deleted, len(file_paths),
+            )
+        return deleted
 
     def search(
         self,
@@ -265,6 +330,53 @@ class VectorStore:
             "languages": languages,
             "index_size_bytes": index_size,
         }
+
+    def compact(self, retain: timedelta = DEFAULT_VERSION_RETENTION) -> None:
+        """Merge small data fragments and drop superseded versions.
+
+        Every write to the table — each batch added, each delete — leaves
+        behind a version manifest, a transaction record and, for deletes,
+        a deletion file. Nothing removes them, so they accumulate across
+        every build the project has ever run: one 23,000-file project had
+        83,958 such files, and because each new write reads the manifest
+        chain and syncs into those directories, every build made the next
+        one slower.
+
+        Measured on one such table: 3.1 GB across 31,947 versions and
+        897 data files became 1.9 GB across 2 versions and 446 data
+        files, row count unchanged, in 35 seconds. Running it again
+        immediately costs nothing and changes nothing, so the price is
+        paid once on a neglected table and never again.
+
+        Compaction is best-effort. A failure here leaves a working but
+        unoptimised table, which is not worth failing a completed build
+        over — it is logged and swallowed.
+
+        Args:
+            retain: Versions younger than this are kept, so a concurrent
+                reader holding an older snapshot is not pulled out from
+                under. History older than this is not recoverable
+                afterwards, which is the point.
+        """
+        table = self._get_table()
+        if table is None:
+            return
+
+        started = time.monotonic()
+        try:
+            # ``optimize`` merges fragments and drops old versions in one
+            # step. The older ``compact_files`` / ``cleanup_old_versions``
+            # pair is deprecated and, unlike this, needs the separate
+            # ``pylance`` package that a normal install does not pull in.
+            table.optimize(cleanup_older_than=retain)
+        except Exception as exc:
+            # An unoptimised table still answers every query correctly, so
+            # this is not worth failing a completed build over.
+            logger.warning("Store compaction skipped: %s", exc)
+            return
+        logger.info(
+            "Compacted the vector store in %.1fs", time.monotonic() - started,
+        )
 
     def has_index(self) -> bool:
         """Check if the index table exists and has data."""
