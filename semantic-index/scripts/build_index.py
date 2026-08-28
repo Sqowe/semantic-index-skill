@@ -24,6 +24,11 @@ from lib.chunker import chunk_file
 from lib.embedder import Embedder
 from lib.models import ConfigError, EmbeddingError, IndexingError, SemanticIndexError
 from lib.store import VectorStore
+from lib.truncation_visibility import (
+    accumulate_truncation,
+    build_truncation_summary,
+    log_truncated_files,
+)
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -148,6 +153,15 @@ def main() -> None:
         # --- Phase 1: process new/changed files in batches ---
         total_chunks_created = 0
         total_api_calls = 0
+        # Phase 4 visibility: accumulate truncation count and the set of
+        # files that had at least one truncated chunk. ``truncation_stats``
+        # is populated by ``Embedder.embed_chunks`` whenever a chunk had
+        # to be shortened to fit the model's context window; the chunk
+        # remains in the index but the embedding vector only covers the
+        # surviving prefix. Surfacing this in the build summary lets
+        # callers know to inspect specific files for coverage gaps.
+        total_truncated = 0
+        truncated_files: set[str] = set()
         chunk_counts: dict[str, int] = {}
         file_batch_size = max(1, args.batch_size)
         files_to_index = changes.to_index
@@ -180,6 +194,12 @@ def main() -> None:
             batch_api_calls = 0
             if batch_chunks:
                 batch_api_calls = embedder.embed_chunks(batch_chunks)
+                # Capture any truncations this batch produced. The
+                # shared helper handles the per-batch delta and file
+                # set accumulation; see ``truncation_visibility.py``.
+                total_truncated = accumulate_truncation(
+                    embedder, total_truncated, truncated_files,
+                )
 
             # 3. Commit to store: delete old, add new
             try:
@@ -226,12 +246,20 @@ def main() -> None:
             del batch_chunks
 
         # --- Phase 2: handle deletions after all batches succeed ---
-        for file_path in changes.to_delete:
-            store.delete_by_file(file_path)
-            bm25.delete_by_file(file_path)
-            logger.info("Deleted chunks for removed file: %s", file_path)
+        # In one pass, not one per file: each store delete is its own
+        # transaction and each BM25 delete sweeps the whole inverted
+        # index, so removing files one at a time is quadratic in the size
+        # of the index rather than of the removal.
+        if changes.to_delete:
+            logger.info("Removing %d deleted files from the index...",
+                        len(changes.to_delete))
+            store.delete_by_files(changes.to_delete)
+            bm25.delete_by_files(changes.to_delete)
+            for file_path in changes.to_delete:
+                logger.debug("Deleted chunks for removed file: %s", file_path)
 
         # --- Phase 3: save BM25 index and update manifest ---
+        store.compact()
         bm25.save()
         update_manifest(args.project_dir, changes, chunk_counts)
 
@@ -245,6 +273,16 @@ def main() -> None:
             "duration_seconds": round(duration, 1),
             "embedding_api_calls": total_api_calls,
         }
+        # Phase 4 visibility: surface the truncation count. The set of
+        # affected file paths is included in the JSON for callers that
+        # want to act on it programmatically; the human-readable
+        # message gives the gist. A ``truncated_chunks`` of 0 means no
+        # chunk was shortened — the field is always present so callers
+        # can rely on it.
+        result.update(build_truncation_summary(total_truncated, truncated_files))
+        # INFO-log the affected file paths so they show up in the
+        # build log without polluting the per-file progress output.
+        log_truncated_files(truncated_files)
         print(json.dumps(result, indent=2))
 
     except (EmbeddingError, IndexingError) as exc:

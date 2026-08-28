@@ -90,14 +90,14 @@ Languages without a Tree-sitter grammar fall back to blank-line splitting.
 | Top-level nodes | `function_definition`, `struct_specifier`, `enum_specifier`, `type_definition`, `declaration` |
 | Method nodes | None (C has no classes) |
 | Body node types | N/A |
-| Notes | C has no class/method concept. All functions are top-level. `struct_specifier` and `enum_specifier` capture type definitions. `declaration` catches global variables and function prototypes. |
+| Notes | C has no class/method concept. All functions are top-level. `struct_specifier` and `enum_specifier` capture type definitions. `declaration` catches global variables and function prototypes. A `.h` file that the C grammar cannot parse is re-parsed with the C++ grammar and chunked as C++ — see *Grammar fallback* below. |
 
 ### C++
 
 | Attribute | Value |
 |-----------|-------|
 | Grammar package | `tree-sitter-cpp` |
-| File extensions | `.cpp`, `.hpp` |
+| File extensions | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` |
 | Top-level nodes | `function_definition`, `class_specifier`, `struct_specifier`, `enum_specifier`, `namespace_definition`, `template_declaration`, `type_definition`, `declaration` |
 | Method nodes | `function_definition` (inside class body); `field_declaration` nodes containing a `function_declarator` are also recognized as methods during oversized class splitting |
 | Body node types | `field_declaration_list`, `declaration_list` |
@@ -138,6 +138,87 @@ blank-line-based splitting. The fallback:
 
 This produces reasonable chunks for prose and configuration files but lacks
 the semantic precision of AST-aware splitting.
+
+### Grammar fallback
+
+A file extension does not always settle which grammar fits. A `.h` file
+holds C in a C project and C++ in a C++ one, and both reach the chunker
+as C. Deciding from the extension gets one of the two wrong: measured on
+one C++ codebase, the C grammar failed to parse 98% of its `.h` files
+where the C++ grammar failed on 3%.
+
+So the file decides, not its name. The grammar named by the extension is
+tried first; only if that parse comes back with errors is an alternate
+tried. The first alternate that parses cleanly wins, and if none does,
+the one with the fewest error nodes wins. A file that no grammar can
+handle keeps the original grammar and behaves exactly as before.
+
+The winning grammar is then used throughout — node types, symbol
+extraction, and the `language` field recorded on each chunk. A C++ header
+named `.h` therefore produces chunks tagged `cpp`.
+
+| Declared language | Alternates tried |
+|-------------------|------------------|
+| `c` | `cpp` |
+
+Alternates are declared in `GRAMMAR_ALTERNATES` in
+`scripts/lib/chunkers/code.py`. A language absent from that table is
+never re-parsed, so the retry costs nothing for every other language.
+
+---
+
+## Structured Configuration (YAML, Helm templates)
+
+YAML keeps its structure in indentation, not in blank lines, and most of it
+has almost no blank lines at all — across one estate of Helm charts and
+Kubernetes manifests the median file was 2.6% blank. The generic fallback
+therefore cut such files at arbitrary token boundaries, mid-key and
+sometimes mid-word.
+
+### YAML (`.yaml`, `.yml`) — `chunkers/yaml_config.py`
+
+1. The file is divided at `---` into documents. With more than one, each
+   chunk records `doc_index`.
+2. Each document is divided into its top-level keys.
+3. Any key whose block is still over budget is divided again into its own
+   children, as deep as needed, capped by `MAX_SPLIT_DEPTH`.
+4. Consecutive small keys are grouped together up to the budget.
+
+A chunk that is not a whole top-level key gets a breadcrumb comment naming
+where it came from, and the same path in `metadata["key_path"]` and in
+`symbol_name`:
+
+```yaml
+# spec.template.spec.containers[].env
+            - name: LOG_LEVEL
+              value: info
+```
+
+Sequence steps render as `[]`. Because of the breadcrumb, a nested chunk's
+text is not byte-identical to the file; `start_line` still points at the
+first real line.
+
+Nothing here parses YAML. Helm charts are Go templates that are not valid
+YAML until rendered, and they are most of the `.yaml` in a typical
+repository, so a parser would reject the files that need this most. One
+consequence is worth knowing: a template directive such as
+`{{- include "chart.labels" . | nindent 4 }}` is written flush left however
+deep the content it stands for, so its indentation is ignored when working
+out the structure.
+
+Content inside a block scalar (`config: |`) holding embedded XML, CSV or
+JSON has no YAML structure left to split on, and falls back to token
+boundaries.
+
+### Helm template libraries (`.tpl`) — `chunkers/helm_template.py`
+
+A `.tpl` file is a library of named templates. Each `{{ define "name" }}`
+block becomes one chunk, named by the template it defines — the name lands
+in both `symbol_name` and `metadata["template_name"]`. Nesting of `if`,
+`range`, `with` and `block` is tracked so the `{{ end }}` closing a
+conditional is not mistaken for the one closing the definition. Text
+outside any definition becomes a `module_level` chunk, and an unterminated
+definition runs to the end of the file.
 
 ---
 
@@ -250,11 +331,13 @@ optional — install via `bash setup.sh --with-office`.
 | `.go` | Go | Tree-sitter AST |
 | `.rs` | Rust | Tree-sitter AST |
 | `.java` | Java | Tree-sitter AST |
-| `.c`, `.h` | C | Tree-sitter AST |
-| `.cpp`, `.hpp` | C++ | Tree-sitter AST |
+| `.c`, `.h` | C | Tree-sitter AST (`.h` falls back to C++, see below) |
+| `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` | C++ | Tree-sitter AST |
 | `.rb` | Ruby | Tree-sitter AST |
 | `.php` | PHP | Tree-sitter AST |
 | `.md`, `.mdx` | Markdown | Header-based |
+| `.yaml`, `.yml` | YAML | Indentation-aware, by key path |
+| `.tpl` | Helm template | One chunk per `define` block |
 | `.dita` | DITA XML | XML topic-based |
 | `.ditamap` | DITA Map | XML topicref-based |
 | `.pdf` | PDF | Page-based extraction |

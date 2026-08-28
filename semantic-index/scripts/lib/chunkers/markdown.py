@@ -7,10 +7,12 @@ Sections exceeding max_tokens are split at paragraph boundaries.
 
 import re
 from bisect import bisect_right
+from typing import Optional
 
-from .common import count_tokens, get_tokenizer, make_chunk_id
+from .common import count_tokens as _base_count_tokens, hard_split_by_tokens, make_chunk_id
 from ..config import Config
 from ..models import Chunk, ChunkType
+from ..tokenizer_resolver import TokenizerWrapper
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
@@ -20,6 +22,8 @@ def chunk_markdown(
     content: str,
     file_path: str,
     config: Config,
+    tokens: Optional[TokenizerWrapper] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Split a markdown file into chunks by headers.
 
@@ -27,10 +31,27 @@ def chunk_markdown(
     - Each header section becomes a chunk.
     - Sections exceeding max_tokens are split at paragraph boundaries.
     - Each chunk preserves the header hierarchy in metadata.
+
+    Args:
+        content: File text.
+        file_path: Project-relative path.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper for token counts and splits. Defaults
+            to the resolver's tiktoken fallback.
+        effective_max: The chunker's effective max tokens (post
+            safety-factor adjustment). When None, ``chunking.max_tokens``
+            is used (legacy behaviour for tests that do not pass a
+            resolver).
     """
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
+    def hard_split(line: str, budget: int) -> list[str]:
+        return hard_split_by_tokens(line, budget, tokens=tokens)
+
     chunks: list[Chunk] = []
     lines = content.split("\n")
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
 
     # Extract frontmatter
@@ -135,6 +156,7 @@ def chunk_markdown(
             # Split at paragraph boundaries (double newline)
             sub_chunks = _split_text_by_paragraphs(
                 section_text, adj_start + 1, file_path, max_tokens, min_tokens, meta,
+                count_tokens, hard_split,
             )
             chunks.extend(sub_chunks)
 
@@ -148,11 +170,17 @@ def _split_text_by_paragraphs(
     max_tokens: int,
     min_tokens: int,
     metadata: dict,
+    count_tokens,
+    hard_split,
 ) -> list[Chunk]:
     """Split text into chunks at paragraph boundaries (double newlines).
 
     Uses character offset tracking to compute accurate line numbers,
     accounting for variable numbers of blank lines between paragraphs.
+
+    ``count_tokens`` and ``hard_split`` are passed in from the caller so
+    the chunker can route every token count through the resolver chosen
+    by the dispatch layer.
     """
     # Find paragraph boundaries with their positions in the original text
     gap_pattern = re.compile(r"\n\n+")
@@ -243,7 +271,7 @@ def _split_text_by_paragraphs(
                         sub_tokens = 0
 
                     # Hard-split the oversized line by token window
-                    line_pieces = _split_line_by_tokens(pline, max_tokens)
+                    line_pieces = hard_split(pline, max_tokens)
                     line_start_ln = _offset_to_line(line_offset)
                     for piece in line_pieces[:-1]:
                         tc = count_tokens(piece)
@@ -327,36 +355,22 @@ def _split_text_by_paragraphs(
     return chunks
 
 
-def _split_line_by_tokens(line: str, max_tokens: int) -> list[str]:
+# Backward-compatibility shim: previously ``_split_text_by_paragraphs``
+# delegated oversized-line splits to ``_split_line_by_tokens``. The
+# splitter now takes a ``hard_split`` closure threaded in by the
+# caller, which lets every token count in the chunker use the same
+# resolver. ``_split_line_by_tokens`` is no longer called from inside
+# this module but remains importable for any external test or script
+# that may rely on the name.
+def _split_line_by_tokens(
+    line: str,
+    max_tokens: int,
+    tokens: Optional[TokenizerWrapper] = None,
+) -> list[str]:
     """Hard-split a single long line into pieces respecting max_tokens.
 
-    Uses tiktoken to split at exact token boundaries. Includes a
-    round-trip safety check to guarantee UTF-8 fidelity — if a token
-    slice doesn't decode cleanly, falls back to extending/shrinking
-    the window until the round-trip is valid.
+    Thin wrapper over the shared splitter in common.py. Kept for
+    backward compatibility with external callers; ``_split_text_by_paragraphs``
+    uses a closure passed in by the caller instead.
     """
-    enc = get_tokenizer()
-    tokens = enc.encode(line)
-    pieces: list[str] = []
-
-    i = 0
-    while i < len(tokens):
-        end = min(i + max_tokens, len(tokens))
-        token_slice = tokens[i:end]
-        decoded = enc.decode(token_slice)
-
-        # Round-trip check: ensure no corruption from mid-character splits
-        if enc.encode(decoded) != token_slice:
-            # Shrink window until round-trip is clean
-            while end > i + 1:
-                end -= 1
-                token_slice = tokens[i:end]
-                decoded = enc.decode(token_slice)
-                if enc.encode(decoded) == token_slice:
-                    break
-
-        if decoded:
-            pieces.append(decoded)
-        i = end
-
-    return pieces if pieces else [line]
+    return hard_split_by_tokens(line, max_tokens, tokens=tokens)

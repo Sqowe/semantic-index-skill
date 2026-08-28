@@ -11,11 +11,41 @@ from typing import Optional
 
 import requests
 
+from ..chunkers.common import count_tokens
 from ..models import EmbeddingError
+from ..tokenizer_resolver import (
+    TokenizerWrapper,
+    resolver_for_config,
+)
 
 logger = logging.getLogger(__name__)
 
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+
+# How many times a single request will wait out an HTTP 429 before giving
+# up, and the ceiling on the backoff between those waits.
+#
+# These are separate from ``embedding.max_retries``, which governs failed
+# requests. Rate limiting is a property of the provider and the moment,
+# not of the project's content, so it is tuned here rather than in the
+# project config. Eight waits backing off 1, 2, 4, 8, 16, 32, 60, 60
+# seconds is about three minutes of patience — long enough to ride out a
+# burst on a bulk build, short enough to fail visibly if the account is
+# genuinely throttled. A ``Retry-After`` header always wins over this.
+MAX_RATE_LIMIT_WAITS = 8
+MAX_RATE_LIMIT_DELAY_SECONDS = 60.0
+
+# Token margin kept inside ``max_embed_tokens`` whenever we truncate. The
+# embedding API counts tokens with its own tokenizer; ours is at best the
+# same model (so the count matches exactly) and at worst tiktoken cl100k
+# (which under-counts bge-m3 by 1.30x median / 2.13x worst case). Fifty
+# tokens of slack absorbs normal drift between local and remote tokenizers
+# so the truncated prefix still lands under the model's context window.
+_TRUNCATION_TOKEN_MARGIN = 50
+
+# Floor on the per-step length in ``_progressive_truncate``. Below this
+# the API request cannot meaningfully embed anything and we give up.
+_MIN_TRUNCATE_CHARS = 100
 
 
 class OpenRouterProvider:
@@ -41,6 +71,20 @@ class OpenRouterProvider:
         self._max_retries = config.embedding.max_retries
         self._retry_delay = config.embedding.retry_delay_seconds
         self._max_embed_chars = config.embedding.max_embed_chars
+        self._max_embed_tokens = config.embedding.max_embed_tokens
+        # Resolver bound to the active embedding model. Used to count
+        # tokens for the embed-time cap and for the direct-computation
+        # progressive truncate. OpenRouter-only installs fall back to
+        # tiktoken cl100k_base (see tokenizer_resolver.py).
+        self._tokens: TokenizerWrapper = resolver_for_config(config)
+        # First WARNING per build for pre-embed token-based truncation;
+        # subsequent occurrences log at DEBUG. The Embedder is created
+        # fresh per build, so this attribute is naturally per-build with
+        # no reset needed.
+        self._first_embed_truncate_warning_logged = False
+        # First WARNING per build for single-text progressive truncate;
+        # subsequent occurrences log at DEBUG. Same lifetime as above.
+        self._first_progressive_truncate_warning_logged = False
 
         if not self._api_key:
             raise EmbeddingError(
@@ -72,8 +116,15 @@ class OpenRouterProvider:
             body["dimensions"] = self._dimensions
 
         last_error: Optional[Exception] = None
+        # Transport failures and rate limits are counted separately. A 429
+        # is not a failure — it is the server saying "wait" — so spending
+        # the error budget on it means three rate-limit responses in a row
+        # end a build no matter how healthy the connection is. On a job
+        # embedding tens of thousands of chunks that happens routinely.
+        attempt = 0
+        rate_limit_waits = 0
 
-        for attempt in range(self._max_retries):
+        while attempt < self._max_retries:
             try:
                 resp = requests.post(
                     OPENROUTER_EMBEDDINGS_URL,
@@ -132,7 +183,10 @@ class OpenRouterProvider:
 
                 # Handle rate limiting
                 if resp.status_code == 429:
-                    fallback_delay = self._retry_delay * (2 ** attempt)
+                    fallback_delay = min(
+                        self._retry_delay * (2 ** rate_limit_waits),
+                        MAX_RATE_LIMIT_DELAY_SECONDS,
+                    )
                     raw_retry = resp.headers.get("Retry-After")
                     try:
                         retry_after = float(raw_retry) if raw_retry else fallback_delay
@@ -148,8 +202,24 @@ class OpenRouterProvider:
                             retry_after, fallback_delay,
                         )
                         retry_after = fallback_delay
-                    logger.warning("Rate limited, retrying in %.1fs", retry_after)
+                    rate_limit_waits += 1
+                    last_error = EmbeddingError(
+                        f"rate limited by the API {rate_limit_waits} time(s) "
+                        f"in a row (HTTP 429)"
+                    )
+                    if rate_limit_waits > MAX_RATE_LIMIT_WAITS:
+                        logger.error(
+                            "Still rate limited after %d waits; giving up on "
+                            "this batch", MAX_RATE_LIMIT_WAITS,
+                        )
+                        break
+                    logger.warning(
+                        "Rate limited (wait %d/%d), retrying in %.1fs",
+                        rate_limit_waits, MAX_RATE_LIMIT_WAITS, retry_after,
+                    )
                     time.sleep(retry_after)
+                    # Deliberately does not advance ``attempt``: waiting out
+                    # a rate limit is not a failed attempt.
                     continue
 
                 resp.raise_for_status()
@@ -223,25 +293,34 @@ class OpenRouterProvider:
 
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt < self._max_retries - 1:
-                    delay = self._retry_delay * (2 ** attempt)
+                delay = self._retry_delay * (2 ** attempt)
+                attempt += 1
+                if attempt < self._max_retries:
                     logger.warning(
                         "API call failed (attempt %d/%d), retrying in %.1fs: %s",
-                        attempt + 1, self._max_retries, delay, exc,
+                        attempt, self._max_retries, delay, exc,
                     )
                     time.sleep(delay)
 
         raise EmbeddingError(
-            f"Embedding API failed after {self._max_retries} retries: {last_error}"
+            f"Embedding API failed after {attempt} attempt(s) and "
+            f"{rate_limit_waits} rate-limit wait(s): {last_error}"
         )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of document texts.
 
-        Adds the document prefix before sending to the API.
-        Truncates texts exceeding max_embed_chars to prevent API errors.
-        If a single text still exceeds the model's token limit after
-        truncation, progressively reduces it by 25% until it fits.
+        Adds the document prefix before sending to the API. The primary
+        cap is the configured ``max_embed_tokens`` (counted with the
+        resolver bound to the active embedding model); ``max_embed_chars``
+        stays as a hard safety net for tokenizer drift — if our local
+        count is significantly under the API's actual count, the char
+        ceiling still prevents sending a payload the API will reject.
+
+        A single text that still exceeds the model's token limit after
+        this pre-truncation falls through to ``_progressive_truncate``,
+        which computes the right cut directly from the measured token
+        count instead of stepping down 25% at a time.
 
         Args:
             texts: Raw text strings to embed.
@@ -253,17 +332,25 @@ class OpenRouterProvider:
         truncated_count = 0
         for t in texts:
             full = self._doc_prefix + t
-            if len(full) > self._max_embed_chars:
+            truncated = self._cap_to_token_budget(full)
+            if truncated is not full:
                 truncated_count += 1
-                full = full[: self._max_embed_chars]
+                full = truncated
             prefixed.append(full)
         if truncated_count:
-            logger.warning(
-                "Truncated %d/%d texts to %d chars for embedding",
-                truncated_count,
-                len(texts),
-                self._max_embed_chars,
-            )
+            if not self._first_embed_truncate_warning_logged:
+                logger.warning(
+                    "Pre-truncated %d/%d texts to fit %d-token budget "
+                    "(hard char ceiling: %d)",
+                    truncated_count, len(texts),
+                    self._max_embed_tokens, self._max_embed_chars,
+                )
+                self._first_embed_truncate_warning_logged = True
+            else:
+                logger.debug(
+                    "Pre-truncated %d/%d texts to fit %d-token budget",
+                    truncated_count, len(texts), self._max_embed_tokens,
+                )
 
         try:
             return self._call_api(prefixed)
@@ -286,8 +373,64 @@ class OpenRouterProvider:
                 raise RuntimeError(f"context length exceeded: {exc}") from exc
             return self._progressive_truncate(prefixed[0])
 
+    def _cap_to_token_budget(self, text: str) -> str:
+        """Return *text* shortened to fit ``max_embed_tokens`` if needed.
+
+        The token count uses the resolver bound to the active embedding
+        model (the model's own tokenizer when reachable, tiktoken
+        ``cl100k_base`` otherwise). When a shorten is required, the
+        char cut is computed from the text's measured chars/token ratio
+        with a ``_TRUNCATION_TOKEN_MARGIN`` slack so normal
+        local-vs-remote tokenizer drift does not push the truncated
+        payload back over the model's context window.
+
+        ``max_embed_chars`` is applied after the token-based cut as a
+        hard ceiling — a defense-in-depth measure for tokenizer drift
+        that was not absorbed by the margin (a base64-like blob can
+        have a wildly different chars/token ratio than the rest of the
+        corpus).
+
+        Returns *text* unchanged when it already fits; the identity
+        check is intentional, callers compare with ``is`` to detect
+        whether truncation happened.
+        """
+        measured_tokens = count_tokens(text, tokens=self._tokens)
+        if measured_tokens <= self._max_embed_tokens:
+            # Even if token-count is fine, the char ceiling is the hard
+            # guard — tokenizer drift could still mean the API sees more
+            # tokens than we measured.
+            if len(text) <= self._max_embed_chars:
+                return text
+            return text[: self._max_embed_chars]
+
+        # Token budget exceeded. Compute a char cut that targets
+        # ``max_embed_tokens - margin`` tokens using the text's own
+        # chars/token ratio.
+        target_tokens = max(
+            1, self._max_embed_tokens - _TRUNCATION_TOKEN_MARGIN,
+        )
+        chars_per_token = len(text) / measured_tokens
+        target_chars = max(1, int(target_tokens * chars_per_token))
+        truncated = text[:target_chars]
+
+        # Hard char ceiling: if the token-based cut still exceeds the
+        # chars ceiling, cut further. This is the defense-in-depth path
+        # for the case where our local token count was wildly optimistic.
+        if len(truncated) > self._max_embed_chars:
+            truncated = truncated[: self._max_embed_chars]
+        return truncated
+
     def _progressive_truncate(self, text: str) -> list[list[float]]:
-        """Progressively reduce text length by 25% until it fits the model.
+        """Shorten a single text until it fits the model's context window.
+
+        The first attempt uses a direct computation from the measured
+        token count, targeting ``max_embed_tokens - margin`` tokens and
+        deriving the char cut from the text's own chars/token ratio. In
+        the common case this lands on the first try and no further
+        round trips are made. If the API still rejects (e.g., the local
+        count was wildly off because of a tokenizer mismatch), we fall
+        back to a finer stepping loop that drops the limit by 25% per
+        step until it fits or hits the ``_MIN_TRUNCATE_CHARS`` floor.
 
         Args:
             text: The prefixed text that exceeded the token limit.
@@ -296,28 +439,74 @@ class OpenRouterProvider:
             List containing a single embedding vector.
 
         Raises:
-            RuntimeError: If text cannot be embedded even at 100 chars.
+            RuntimeError: If text cannot be embedded even at
+                ``_MIN_TRUNCATE_CHARS`` chars.
         """
-        limit = len(text)
-        while limit > 100:
-            limit = limit * 3 // 4  # reduce by 25% each iteration
-            logger.warning(
-                "Single text still exceeds token limit, "
-                "retrying with %d chars (was %d)",
-                limit,
-                len(text),
-            )
-            try:
-                return self._call_api([text[:limit]])
-            except (RuntimeError, EmbeddingError) as retry_exc:
-                exc_str = str(retry_exc).lower()
-                if "context length" not in exc_str and "input length" not in exc_str:
-                    raise
-                continue
-        # If we get here, even 100 chars fails — give up
-        raise RuntimeError(
-            f"context length exceeded: text cannot be embedded even at 100 chars"
+        measured_tokens = count_tokens(text, tokens=self._tokens)
+        target_tokens = max(
+            1, self._max_embed_tokens - _TRUNCATION_TOKEN_MARGIN,
         )
+        chars_per_token = len(text) / max(1, measured_tokens)
+        target_chars = max(1, int(target_tokens * chars_per_token))
+        # The hard char ceiling may sit below the computed target.
+        # Also cap by the actual text length so we never send more
+        # than we have — sending the full text again is exactly the
+        # call that just failed, which would waste the iteration.
+        target_chars = min(target_chars, len(text), self._max_embed_chars)
+
+        if not self._first_progressive_truncate_warning_logged:
+            logger.warning(
+                "Single text exceeds token limit (%d tokens > %d); "
+                "truncating to %d chars (was %d)",
+                measured_tokens, self._max_embed_tokens,
+                target_chars, len(text),
+            )
+            self._first_progressive_truncate_warning_logged = True
+        else:
+            logger.debug(
+                "Single text exceeds token limit (%d tokens > %d); "
+                "truncating to %d chars",
+                measured_tokens, self._max_embed_tokens, target_chars,
+            )
+
+        try:
+            return self._call_api([text[:target_chars]])
+        except (RuntimeError, EmbeddingError) as retry_exc:
+            exc_str = str(retry_exc).lower()
+            if "context length" not in exc_str and "input length" not in exc_str:
+                raise
+            # Direct computation was insufficient — the local count was
+            # under-counting. Fall back to a finer stepping loop from
+            # ``target_chars`` downward. Track the last context-length
+            # error so we can re-raise it (preserving the original
+            # message text the Embedder matches on) if the loop
+            # exhausts — that lets the Embedder split the batch.
+            last_length_error = retry_exc
+            limit = target_chars
+            while limit > _MIN_TRUNCATE_CHARS:
+                previous_chars = limit
+                limit = limit * 3 // 4
+                logger.debug(
+                    "Direct truncation insufficient; retrying with %d chars "
+                    "(was %d)", limit, previous_chars,
+                )
+                try:
+                    return self._call_api([text[:limit]])
+                except (RuntimeError, EmbeddingError) as retry_exc2:
+                    exc_str = str(retry_exc2).lower()
+                    if (
+                        "context length" not in exc_str
+                        and "input length" not in exc_str
+                    ):
+                        raise
+                    last_length_error = retry_exc2
+                    continue
+            # If we get here, even the floor was rejected — re-raise
+            # the last context-length error so the caller can split.
+            # Wrap as RuntimeError because the Embedder's split path
+            # only catches RuntimeError; an EmbeddingError instance
+            # would propagate up unhandled and crash the build.
+            raise RuntimeError(str(last_length_error)) from last_length_error
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single search query.

@@ -71,17 +71,20 @@ semantic-index/                     # SKILL root (installed to ~/.kiro/skills/)
 │   └── lib/                        # Python package
 │       ├── models.py config.py hasher.py   # Core: data, config, change detection
 │       ├── chunker.py              # Dispatch + fallback
-│       ├── chunkers/               # code.py markdown.py dita.py office.py common.py
+│       ├── chunkers/               # code.py markdown.py dita.py office.py
+│       │                          # yaml_config.py helm_template.py common.py
 │       ├── embedder.py             # Provider ABC, factory, cache
 │       ├── providers/              # openrouter.py huggingface.py
 │       ├── store.py bm25.py        # Storage: vector + keyword
 │       ├── fusion.py reranker.py   # Search: RRF merge + optional reranking
 │       └── constants.py            # Shared constants
-└── tests/                          # pytest suite (10 test files)
+└── tests/                          # pytest suite (11 test files)
 ```
 
 **Critical paths:** Entry points are `build_index.py`, `semantic_search.py`, `index_status.py`.
 Config template: `assets/default-config.json`. Per-project data: `<project>/.index/` (gitignored).
+`lib/constants.py` is stdlib-only (no tiktoken/tree-sitter) so it's safe to import from anywhere,
+including `hasher.py` and `migrate_config.py`, without pulling in heavy optional deps.
 
 ---
 
@@ -89,7 +92,7 @@ Config template: `assets/default-config.json`. Per-project data: `<project>/.ind
 
 ### 4.1 Chunking Pipeline (`lib/chunkers/`)
 
-Five strategies dispatched by file extension via `chunker.py`:
+Seven strategies dispatched by file extension via `chunker.py`:
 
 | Strategy | Module | Formats | Method |
 |----------|--------|---------|--------|
@@ -97,13 +100,15 @@ Five strategies dispatched by file extension via `chunker.py`:
 | Markdown | `markdown.py` | .md .mdx .rst | Header-based section splitting |
 | DITA | `dita.py` | .dita .ditamap | XML topic-based parsing |
 | Office | `office.py` | .pdf .docx .pptx | Page/heading/slide-based (binary I/O) |
+| YAML | `yaml_config.py` | .yaml .yml | Indentation-aware, recursive by key path |
+| Helm | `helm_template.py` | .tpl | One chunk per named `define` block |
 | Fallback | `chunker.py` | everything else | Blank-line splitting |
 
 ### 4.2 Embedding System (`lib/embedder.py` + `lib/providers/`)
 
 Provider pattern with lazy imports. Factory selects provider from config.
 `openrouter.py` — REST API with batching + retry. `huggingface.py` — local inference, auto device detection.
-Embedding cache (`embedding_cache.json`) sits above the provider layer.
+Embedding cache (`embedding_cache.db`, SQLite) sits above the provider layer.
 Both providers produce identical vectors for the same model — indexes are cross-compatible.
 
 ### 4.3 Search & Retrieval
@@ -176,9 +181,10 @@ Defaults (`assets/default-config.json`) → `.index/config.json` (per-project) �
 <project-root>/.index/
 ├── config.json            # User config (created on first run)
 ├── manifest.json          # SHA-256 file hash manifest
-├── embedding_cache.json   # Content hash → vector cache
+├── embedding_cache.db     # Content hash → vector cache (SQLite)
 ├── bm25_index.json        # BM25 keyword index
-└── lancedb/chunks.lance/  # LanceDB vector store (Arrow format)
+└── lancedb/chunks.lance/  # LanceDB vector store (Arrow format);
+                           # compacted at the end of each build
 ```
 
 ### Environment Variables
@@ -207,15 +213,15 @@ Defaults (`assets/default-config.json`) → `.index/config.json` (per-project) �
 | Zone | Component | Notes |
 |------|-----------|-------|
 | ✅ Stable | `models.py`, `config.py`, `hasher.py` | Core data model and config. Everything depends on these. |
-| ✅ Stable | `chunkers/code.py`, `chunkers/markdown.py` | Battle-tested across real projects. |
 | ✅ Stable | `chunker.py` (dispatch) | Extend by adding new chunkers, don't restructure. |
 | ✅ Stable | `store.py`, `embedder.py`, `providers/openrouter.py` | Stable interfaces. Retry, batching, caching all done. |
 | ✅ Stable | `bm25.py`, `fusion.py` | Hybrid search pipeline. Tune via config, not code. |
 | ✅ Stable | CLI scripts (build, search, status) | JSON output format is a contract — don't break it. |
+| 🔄 Semi-Stable | `chunkers/code.py`, `chunkers/markdown.py`, `chunkers/common.py` | Battle-tested overall, but currently under active revision (chunk-token-budget fixes) — re-check before relying on exact chunk boundaries. |
 | 🔄 Semi-Stable | `providers/huggingface.py`, `reranker.py` | Working. May evolve with new models/backends. |
 | 🔄 Semi-Stable | `chunkers/dita.py` | Functional for standard DITA. Exotic specializations may need updates. |
 | 🔄 Semi-Stable | `mcp_server.py` | Functional bridge. May evolve with MCP protocol updates. |
-| ⚠️ Experimental | `chunkers/office.py` | PDF/DOCX/PPTX working but edge cases remain (scanned PDFs, complex tables). |
+| ⚠️ Experimental | `chunkers/office.py` | PDF/DOCX/PPTX working but edge cases remain (scanned PDFs, complex tables); also under active revision alongside the other chunkers. |
 | ⚠️ Experimental | `migrate_config.py` | Config migration. Needs more real-world testing. |
 | 🔮 Planned | Parallel chunking (`lib/parallel.py`) | Phase 8 — not yet implemented. |
 | 🔮 Planned | Additional providers (Ollama, OpenAI) | Phase 6 — not yet implemented. |

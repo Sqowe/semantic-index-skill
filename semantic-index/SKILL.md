@@ -11,6 +11,7 @@ description: >
   "how does Y work?" about their project. Also trigger when the user
   mentions "semantic search", "index my code", "embeddings", "vector search",
   or "codebase indexing".
+version: 0.2.0
 ---
 
 # Semantic Index
@@ -178,9 +179,21 @@ Success output:
   "files_deleted": 2,
   "chunks_created": 387,
   "duration_seconds": 12.4,
-  "embedding_api_calls": 4
+  "embedding_api_calls": 4,
+  "truncated_chunks": 3,
+  "truncated_files": ["src/big_data.py"]
 }
 ```
+
+`truncated_chunks` counts chunks that were shortened to fit the
+embedding model's context window. Their full text is preserved in
+`chunk.metadata["original_content"]`; the embedding vector only
+covers the surviving prefix, so search hits on those chunks will
+miss anything past it. `truncated_files` lists the project-relative
+paths of files that contributed at least one truncated chunk.
+When `truncated_chunks > 0`, a `truncation_message` field is added
+with a human-readable summary; affected file paths are also
+emitted at DEBUG on the build's stderr stream.
 
 No changes output:
 ```json
@@ -307,6 +320,17 @@ If it doesn't exist, `build_index.py` creates one from defaults on first run.
 Key settings the user might want to change:
 - `embedding.model`: which model to use (default: `BAAI/bge-m3`)
 - `embedding.dimensions`: vector size (default: 1024)
+- `embedding.max_embed_tokens`: the embedding model's context window in
+  tokens; the chunker counts tokens with this model's own tokenizer
+  when available (via the `tokenizers` package + Hugging Face cache)
+  and refuses to send anything larger (default: 8192, the context
+  window for `BAAI/bge-m3`).
+- `embedding.token_safety_factor`: when the chunker falls back to
+  tiktoken `cl100k_base` (because `tokenizers` is not installed or
+  the model's Hugging Face repo is not reachable), the chunking
+  budget is shrunk by this factor to account for the measured
+  ~1.30x (median) to ~2.13x (worst case) ratio between bge-m3 and
+  cl100k tokens (default: 1.6).
 - `chunking.max_tokens`: maximum chunk size (default: 512)
 - `chunking.overlap_tokens`: overlap between chunks (default: 50)
 - `indexing.file_extensions`: which file types to index

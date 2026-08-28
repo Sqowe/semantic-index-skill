@@ -14,7 +14,8 @@ import re
 from bisect import bisect_right
 from typing import Optional
 
-from .common import count_tokens, make_chunk_id, chunk_text_fallback
+from .common import build_chunks, count_tokens as _base_count_tokens, make_chunk_id, chunk_text_fallback
+from ..tokenizer_resolver import TokenizerWrapper
 from ..config import Config
 from ..models import Chunk, ChunkType
 
@@ -22,6 +23,24 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded parsers cache
 _parsers: dict[str, object] = {}
+
+# Grammars to try when the one picked from the file extension cannot parse
+# the file cleanly.
+#
+# An extension does not always settle which grammar fits. A ".h" holds C in
+# a C project and C++ in a C++ one, and both arrive here as "c". Guessing
+# from the extension gets one of the two wrong: measured on one C++
+# codebase, the C grammar failed to parse 98% of its ".h" files where the
+# C++ grammar failed on 3%. Guessing from the content is no better — the
+# markers that distinguish the two (``class``, ``namespace``, ``template``)
+# appear inside comments and string literals as well.
+#
+# So the file itself decides. The declared grammar is tried first and an
+# alternate is consulted only when that parse comes back with errors, which
+# means a project whose headers really are C pays nothing.
+GRAMMAR_ALTERNATES: dict[str, tuple[str, ...]] = {
+    "c": ("cpp",),
+}
 
 # Node types treated as class-like containers for oversized splitting.
 # Shared between chunk_code_with_treesitter (is_class) and _node_to_chunk_type
@@ -310,6 +329,85 @@ def _get_parser(language: str):
     return parser
 
 
+def _count_parse_errors(root) -> int:
+    """Count the ERROR and MISSING nodes in a parse tree.
+
+    Used to compare two candidate grammars when neither parses a file
+    cleanly, so the closer fit still wins. Subtrees that parsed without
+    errors are pruned via ``has_error``, so the walk only descends into
+    the parts of the tree that actually went wrong.
+
+    Args:
+        root: Root node of a Tree-sitter parse tree.
+
+    Returns:
+        The number of error and missing nodes.
+    """
+    total = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if not node.has_error:
+            continue
+        if node.type == "ERROR" or node.is_missing:
+            total += 1
+        stack.extend(node.children)
+    return total
+
+
+def _parse_with_best_grammar(source_bytes: bytes, language: str):
+    """Parse *source_bytes*, retrying with an alternate grammar on failure.
+
+    The grammar named by the file extension is tried first. If it parses
+    cleanly — the common case — nothing else happens and the cost is one
+    parse. Only when it reports errors are the alternates in
+    :data:`GRAMMAR_ALTERNATES` tried: the first one to parse cleanly wins,
+    and if none does, the one with the fewest errors wins. A file no
+    grammar can handle keeps the declared grammar's tree, so behaviour is
+    unchanged from before this fallback existed.
+
+    Args:
+        source_bytes: The file's UTF-8 encoded content.
+        language: Language identifier detected from the file extension.
+
+    Returns:
+        A ``(tree, language)`` pair, where the language is the grammar that
+        actually produced the tree. Callers must use the returned language
+        for node-type lookups and symbol extraction, not the one they
+        passed in. Returns ``(None, language)`` when no parser is available.
+    """
+    parser = _get_parser(language)
+    if parser is None:
+        return None, language
+
+    tree = parser.parse(source_bytes)
+    if not tree.root_node.has_error:
+        return tree, language
+
+    best_tree = tree
+    best_language = language
+    # Counted only if some alternate also fails and the two need comparing.
+    # Walking a badly broken tree is far more expensive than parsing, and
+    # the usual outcome is an alternate that parses cleanly, so this stays
+    # unpaid in the common case.
+    best_errors: Optional[int] = None
+
+    for alternate in GRAMMAR_ALTERNATES.get(language, ()):
+        alt_parser = _get_parser(alternate)
+        if alt_parser is None:
+            continue
+        alt_tree = alt_parser.parse(source_bytes)
+        if not alt_tree.root_node.has_error:
+            return alt_tree, alternate
+        if best_errors is None:
+            best_errors = _count_parse_errors(best_tree.root_node)
+        alt_errors = _count_parse_errors(alt_tree.root_node)
+        if alt_errors < best_errors:
+            best_tree, best_language, best_errors = alt_tree, alternate, alt_errors
+
+    return best_tree, best_language
+
+
 def _extract_symbol_name(node, language: str) -> Optional[str]:
     """Extract the name of a function/class/method from an AST node."""
     # For decorated definitions (Python), look at the inner definition
@@ -440,11 +538,15 @@ def _split_oversized_chunk(
     max_tokens: int,
     min_tokens: int,
     metadata: dict,
+    tokens: Optional["TokenizerWrapper"] = None,
 ) -> list[Chunk]:
     """Split an oversized code chunk at blank lines, then hard-split as last resort.
 
     Uses offset-based line tracking for accurate line numbers.
     """
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
     # Try splitting at blank lines first
     gap_pattern = re.compile(r"\n\n+")
     parts_with_offsets: list[tuple[str, int]] = []
@@ -459,6 +561,21 @@ def _split_oversized_chunk(
         if trailing.strip():
             parts_with_offsets.append((trailing, prev_end))
 
+    def emit(chunk_text: str, s_line: int) -> list[Chunk]:
+        """Build chunks for one accumulated text, hard-splitting if oversized."""
+        return build_chunks(
+            chunk_text,
+            file_path=file_path,
+            start_line=s_line,
+            language=language,
+            chunk_type=chunk_type,
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            symbol_name=symbol_name,
+            metadata=metadata,
+            tokens=tokens,
+        )
+
     if len(parts_with_offsets) > 1:
         chunks: list[Chunk] = []
         current_parts: list[str] = []
@@ -468,23 +585,8 @@ def _split_oversized_chunk(
         for part, offset in parts_with_offsets:
             part_tokens = count_tokens(part)
             if current_tokens + part_tokens > max_tokens and current_parts:
-                chunk_text = "\n\n".join(current_parts)
-                tc = count_tokens(chunk_text)
                 s_line = start_line + content[:current_start_offset].count("\n")
-                e_line = s_line + chunk_text.count("\n")
-                if tc >= min_tokens:
-                    chunks.append(Chunk(
-                        id=make_chunk_id(file_path, chunk_text, s_line),
-                        file_path=file_path,
-                        start_line=s_line,
-                        end_line=e_line,
-                        content=chunk_text,
-                        chunk_type=chunk_type,
-                        language=language,
-                        symbol_name=symbol_name,
-                        token_count=tc,
-                        metadata=metadata.copy(),
-                    ))
+                chunks.extend(emit("\n\n".join(current_parts), s_line))
                 current_start_offset = offset
                 current_parts = []
                 current_tokens = 0
@@ -493,23 +595,8 @@ def _split_oversized_chunk(
             current_tokens += part_tokens
 
         if current_parts:
-            chunk_text = "\n\n".join(current_parts)
-            tc = count_tokens(chunk_text)
             s_line = start_line + content[:current_start_offset].count("\n")
-            e_line = s_line + chunk_text.count("\n")
-            if tc >= min_tokens:
-                chunks.append(Chunk(
-                    id=make_chunk_id(file_path, chunk_text, s_line),
-                    file_path=file_path,
-                    start_line=s_line,
-                    end_line=e_line,
-                    content=chunk_text,
-                    chunk_type=chunk_type,
-                    language=language,
-                    symbol_name=symbol_name,
-                    token_count=tc,
-                    metadata=metadata.copy(),
-                ))
+            chunks.extend(emit("\n\n".join(current_parts), s_line))
 
         if chunks:
             return chunks
@@ -524,21 +611,7 @@ def _split_oversized_chunk(
     for line in lines:
         line_tokens = count_tokens(line)
         if current_tokens + line_tokens > max_tokens and current_lines:
-            chunk_text = "\n".join(current_lines)
-            tc = count_tokens(chunk_text)
-            if tc >= min_tokens:
-                chunks.append(Chunk(
-                    id=make_chunk_id(file_path, chunk_text, current_line),
-                    file_path=file_path,
-                    start_line=current_line,
-                    end_line=current_line + len(current_lines) - 1,
-                    content=chunk_text,
-                    chunk_type=chunk_type,
-                    language=language,
-                    symbol_name=symbol_name,
-                    token_count=tc,
-                    metadata=metadata.copy(),
-                ))
+            chunks.extend(emit("\n".join(current_lines), current_line))
             current_line = current_line + len(current_lines)
             current_lines = []
             current_tokens = 0
@@ -547,21 +620,7 @@ def _split_oversized_chunk(
         current_tokens += line_tokens
 
     if current_lines:
-        chunk_text = "\n".join(current_lines)
-        tc = count_tokens(chunk_text)
-        if tc >= min_tokens:
-            chunks.append(Chunk(
-                id=make_chunk_id(file_path, chunk_text, current_line),
-                file_path=file_path,
-                start_line=current_line,
-                end_line=current_line + len(current_lines) - 1,
-                content=chunk_text,
-                chunk_type=chunk_type,
-                language=language,
-                symbol_name=symbol_name,
-                token_count=tc,
-                metadata=metadata.copy(),
-            ))
+        chunks.extend(emit("\n".join(current_lines), current_line))
 
     return chunks
 
@@ -571,6 +630,8 @@ def chunk_code_with_treesitter(
     file_path: str,
     language: str,
     config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Chunk a code file using Tree-sitter AST parsing.
 
@@ -579,16 +640,46 @@ def chunk_code_with_treesitter(
     Oversized nodes are split at logical boundaries.
 
     Falls back to text splitting if Tree-sitter is unavailable.
+
+    *language* is what the file extension suggests, which is not always
+    what the file contains — a ``.h`` arrives here as C whether it holds C
+    or C++. When that grammar cannot parse the file cleanly, the
+    alternates in :data:`GRAMMAR_ALTERNATES` are tried and the best fit is
+    used instead, for node types, symbol extraction and the language
+    recorded on each chunk alike.
+
+    Args:
+        content: File text.
+        file_path: Project-relative path.
+        language: Language detected from the file extension. Treated as a
+            starting point, not a verdict — see above.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
-    parser = _get_parser(language)
-    if parser is None:
-        return chunk_text_fallback(content, file_path, language, config)
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
 
     source_bytes = content.encode("utf-8")
-    tree = parser.parse(source_bytes)
+    tree, grammar = _parse_with_best_grammar(source_bytes, language)
+    if tree is None:
+        return chunk_text_fallback(
+            content, file_path, language, config, tokens=tokens,
+        )
+    if grammar != language:
+        logger.debug(
+            "%s parses cleaner as %s than as %s; using the %s grammar",
+            file_path, grammar, language, grammar,
+        )
+        # Everything below keys off the grammar that actually parsed the
+        # file: node types, symbol extraction, and the language recorded
+        # on each chunk.
+        language = grammar
     root = tree.root_node
 
-    max_tokens = config.chunking.max_tokens
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     extractable = set(EXTRACTABLE_NODES.get(language, []))
 
@@ -609,6 +700,7 @@ def chunk_code_with_treesitter(
         if is_class and count_tokens(node_text) > max_tokens:
             class_chunks = _chunk_class_node(
                 node, source_bytes, file_path, language, symbol, config,
+                tokens, max_tokens,
             )
             if class_chunks:
                 chunks.extend(class_chunks)
@@ -636,7 +728,7 @@ def chunk_code_with_treesitter(
             # Oversized — split it
             sub_chunks = _split_oversized_chunk(
                 node_text, file_path, start_line, language,
-                chunk_type, symbol, max_tokens, min_tokens, {},
+                chunk_type, symbol, max_tokens, min_tokens, {}, tokens,
             )
             chunks.extend(sub_chunks)
 
@@ -689,6 +781,7 @@ def chunk_code_with_treesitter(
                 sub = _split_oversized_chunk(
                     module_text, file_path, first_line, language,
                     ChunkType.MODULE_LEVEL, None, max_tokens, min_tokens, {},
+                    tokens,
                 )
                 chunks.extend(sub)
 
@@ -702,13 +795,30 @@ def _chunk_class_node(
     language: str,
     class_name: Optional[str],
     config: Config,
+    tokens: Optional["TokenizerWrapper"] = None,
+    effective_max: Optional[int] = None,
 ) -> list[Chunk]:
     """Extract methods from a class node as individual chunks.
 
     If the class is too large, each method becomes its own chunk.
     The class signature (without method bodies) becomes a separate chunk.
+
+    Args:
+        class_node: Tree-sitter class node.
+        source_bytes: Raw file bytes for offset-based extraction.
+        file_path: Project-relative path.
+        language: Detected language.
+        class_name: Class symbol name.
+        config: Loaded configuration.
+        tokens: Tokenizer wrapper. Defaults to the chunkers.common
+            resolver's tiktoken fallback.
+        effective_max: Safety-factor-adjusted chunk budget. When None,
+            ``chunking.max_tokens`` is used (legacy behaviour).
     """
-    max_tokens = config.chunking.max_tokens
+    def count_tokens(text: str) -> int:
+        return _base_count_tokens(text, tokens=tokens)
+
+    max_tokens = effective_max if effective_max is not None else config.chunking.max_tokens
     min_tokens = config.chunking.min_tokens
     method_types = set(METHOD_NODES.get(language, []))
     chunks: list[Chunk] = []
@@ -728,6 +838,43 @@ def _chunk_class_node(
     method_ranges: list[tuple[int, int]] = []
 
     for child in body_node.children:
+        # A container nested directly inside this one. C++ in particular is
+        # written as ``namespace A { namespace B { ... } }``, so the
+        # functions are two levels down and a scan of this body alone finds
+        # nothing — leaving the whole outer namespace as one chunk. Descend
+        # so the definitions inside are reached.
+        if child is not body_node and (
+            child.type in CLASS_LIKE_NODES or "class" in child.type
+        ):
+            nested_text = source_bytes[child.start_byte:child.end_byte].decode(
+                "utf-8", errors="replace",
+            )
+            nested_name = _extract_symbol_name(child, language)
+            if count_tokens(nested_text) > max_tokens:
+                nested_chunks = _chunk_class_node(
+                    child, source_bytes, file_path, language, nested_name,
+                    config, tokens, max_tokens,
+                )
+                if nested_chunks:
+                    chunks.extend(nested_chunks)
+                    method_ranges.append((child.start_byte, child.end_byte))
+                    continue
+            elif count_tokens(nested_text) >= min_tokens:
+                chunks.append(Chunk(
+                    id=make_chunk_id(file_path, nested_text, child.start_point[0] + 1),
+                    file_path=file_path,
+                    start_line=child.start_point[0] + 1,
+                    end_line=child.end_point[0] + 1,
+                    content=nested_text,
+                    chunk_type=_node_to_chunk_type(child.type),
+                    language=language,
+                    symbol_name=nested_name,
+                    token_count=count_tokens(nested_text),
+                    metadata={"parent_class": class_name} if class_name else {},
+                ))
+                method_ranges.append((child.start_byte, child.end_byte))
+                continue
+
         # Handle decorated methods in Python:
         # Check the inner node type for method matching,
         # but use the outer decorated_definition range for content extraction.
@@ -774,7 +921,7 @@ def _chunk_class_node(
                 sub = _split_oversized_chunk(
                     method_text, file_path, start_line, language,
                     ChunkType.METHOD, method_name, max_tokens, min_tokens,
-                    {"parent_class": class_name},
+                    {"parent_class": class_name}, tokens,
                 )
                 chunks.extend(sub)
 
@@ -795,7 +942,9 @@ def _chunk_class_node(
     if sig_parts:
         sig_text = "\n".join(sig_parts)
         tc = count_tokens(sig_text)
-        if tc >= min_tokens:
+        if tc < min_tokens:
+            pass
+        elif tc <= max_tokens:
             chunks.insert(0, Chunk(
                 id=make_chunk_id(file_path, sig_text, class_node.start_point[0] + 1),
                 file_path=file_path,
@@ -808,5 +957,17 @@ def _chunk_class_node(
                 token_count=tc,
                 metadata={},
             ))
+        else:
+            # When no method or nested container was found, "everything not
+            # covered by a method" is the whole class. Emitting that
+            # unchecked hands the caller an over-budget chunk which it
+            # trusts, and the dispatch-level safety net then cuts it at
+            # token boundaries — losing the line numbers, which collapse to
+            # the chunk's first line. Split it here instead, where the
+            # blank-line boundaries are still available.
+            chunks[0:0] = _split_oversized_chunk(
+                sig_text, file_path, class_node.start_point[0] + 1, language,
+                ChunkType.CLASS, class_name, max_tokens, min_tokens, {}, tokens,
+            )
 
     return chunks

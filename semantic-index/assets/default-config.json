@@ -10,6 +10,8 @@
     "document_prefix": "",
     "max_retries": 3,
     "retry_delay_seconds": 1.0,
+    "max_embed_tokens": 8192,
+    "token_safety_factor": 1.6,
     "device": null,
     "trust_remote_code": false
   },
@@ -22,8 +24,10 @@
     "file_extensions": [
       ".py", ".js", ".ts", ".tsx", ".jsx",
       ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
+      ".cc", ".cxx", ".hh", ".hxx", ".txx",
       ".rb", ".php",
       ".md", ".mdx", ".txt", ".rst",
+      ".yaml", ".yml", ".tpl",
       ".dita", ".ditamap",
       ".pdf", ".docx", ".pptx"
     ],

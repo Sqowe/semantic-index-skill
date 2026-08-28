@@ -19,6 +19,7 @@ class ChunkType(Enum):
     PDF_PAGE = "pdf_page"
     DOCX_SECTION = "docx_section"
     PPTX_SLIDE = "pptx_slide"
+    CONFIG_BLOCK = "config_block"
     UNKNOWN = "unknown"
 
 
@@ -67,6 +68,43 @@ class FileChange:
     to_index: list[str] = field(default_factory=list)
     to_delete: list[str] = field(default_factory=list)
     unchanged: int = 0
+
+
+@dataclass
+class TruncationRecord:
+    """Record of a chunk that was shortened before embedding.
+
+    Populated by ``Embedder.embed_chunks`` whenever the pre-embed token
+    cap cut a chunk's content down so it would fit the model's context
+    window. The chunk's ``content`` is replaced with the truncated
+    prefix (that is what gets sent to the API), but the full original
+    text is preserved on ``chunk.metadata["original_content"]`` so
+    search results and later inspection can still read the whole
+    chunk. The embedding vector only covers the surviving prefix, so
+    semantic search on this chunk will miss anything past
+    ``final_tokens``.
+
+    ``final_tokens`` is the token count of the truncated prefix as
+    measured by the Embedder. Because the Embedder reserves room for
+    the provider's ``document_prefix`` in its target budget, the
+    provider's secondary token cap (which counts prefixed text) does
+    not have to shorten further — ``final_tokens`` matches what the
+    embedding API actually saw.
+
+    Attributes:
+        file_path: Project-relative path of the chunk's source file.
+        chunk_id: The chunk's content-hash identifier.
+        original_tokens: Tokens measured before truncation (the model's
+            own tokenizer when available; tiktoken + safety factor
+            otherwise).
+        final_tokens: Tokens after truncation. The vector covers these
+            and only these.
+    """
+
+    file_path: str
+    chunk_id: str
+    original_tokens: int
+    final_tokens: int
 
 
 class SemanticIndexError(Exception):

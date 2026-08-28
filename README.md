@@ -1,5 +1,8 @@
 # Semantic Index Skill
 
+Version 0.2.0 — see [CHANGELOG.md](CHANGELOG.md) for what changed and what
+an upgrade from an earlier version requires.
+
 A portable SKILL for embedding-based indexing and semantic search of codebases and documentation. Designed for Claude Code, Cowork, and any SKILL-compatible AI tool.
 
 Instead of grep/glob for exact string matches, this skill lets you search code by meaning — queries like "where is authentication handled?" or "how does the payment flow work?" return the most relevant code and documentation chunks.
@@ -163,7 +166,7 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | `chunking.overlap_tokens` | `50` | Overlap between adjacent chunks |
 | `chunking.min_tokens` | `20` | Minimum chunk size (smaller chunks are discarded) |
 | `indexing.file_extensions` | See config | Which file types to index |
-| `indexing.exclude_patterns` | See config | Patterns to skip (in addition to `.gitignore`) |
+| `indexing.exclude_patterns` | See config | Patterns to skip (in addition to `.gitignore`) — see [Exclusion Path Rules](#exclusion-path-rules) |
 | `indexing.max_file_size_kb` | `500` | Skip files larger than this |
 | `indexing.max_office_file_size_kb` | `50000` | Max file size for office documents (PDF/DOCX/PPTX) in KB |
 | `search.default_top_k` | `10` | Default number of search results |
@@ -185,9 +188,64 @@ Environment variables take precedence over config file values:
 | `SEMANTIC_INDEX_MODEL` | `embedding.model` |
 | `SEMANTIC_INDEX_DIMENSIONS` | `embedding.dimensions` |
 
+### Exclusion Path Rules
+
+`indexing.exclude_patterns` and `.indexignore` both use `.gitignore` syntax, and
+one rule in that syntax surprises people often enough to be worth stating plainly:
+
+> **A pattern containing a slash is anchored to the project root. A pattern
+> without one matches at any depth.**
+
+So `upgrade/` skips every `upgrade/` directory anywhere in the project, but
+`jenkins/custom-files/` skips only `<project-root>/jenkins/custom-files/` — not
+`eea4-rv/jenkins/custom-files/`. The pattern looks more specific and is in fact
+narrower than intended.
+
+| Pattern | `build/out.js` | `src/build/out.js` | `eea4-rv/jenkins/custom-files/v.yaml` |
+|---------|:---:|:---:|:---:|
+| `build/` | matches | matches | — |
+| `/build/` | matches | — | — |
+| `jenkins/custom-files/` | — | — | — |
+| `**/jenkins/custom-files/` | — | — | matches |
+| `custom-files/` | — | — | matches |
+
+To exclude a nested path wherever it appears, either prefix it with `**/` or
+name only its last segment:
+
+```json
+"exclude_patterns": [
+  "upgrade/",
+  "**/jenkins/custom-files/",
+  "grafana_dashboards/",
+  "/build/"
+]
+```
+
+`config.json` is strict JSON, so it takes no comments. Reading that example
+line by line: the first and third have no slash and so skip those directory
+names at any depth; the second is anchored but starts with `**/`, which
+restores "at any depth" explicitly; the fourth is anchored by its leading
+slash and skips only the `build/` directory at the project root.
+
+Other syntax behaves as in `.gitignore`: `*` matches within one path segment
+(`*.min.js`), `**` crosses segments (`docs/**`), and a trailing `/` restricts the
+match to directories.
+
+To check what a pattern actually covers, run a build and compare the reported
+file count, or search for a path you expected to be gone:
+
+```bash
+python semantic_search.py --project-dir . --query "some text from that directory"
+```
+
+If results still come back from a directory you excluded, the pattern is not
+matching — the anchoring rule above is the usual reason.
+
 ### .indexignore
 
-Create a `.indexignore` file in your project root to exclude additional paths (same syntax as `.gitignore`):
+Create a `.indexignore` file in your project root to exclude additional paths. Same
+syntax as `.gitignore`, and the same anchoring rule as above — a pattern with a
+slash in it is relative to the project root:
 
 ```
 tests/fixtures/
@@ -670,9 +728,26 @@ AST-aware chunking via Tree-sitter is available for 10 languages:
 | Rust | `.rs` | functions, structs, impl blocks |
 | Java | `.java` | classes, methods, interfaces |
 | C | `.c`, `.h` | functions, structs, typedefs |
-| C++ | `.cpp`, `.hpp` | functions, classes, namespaces |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.txx` | functions, classes, namespaces |
 | Ruby | `.rb` | modules, classes, methods |
 | PHP | `.php` | classes, functions, methods |
+
+A `.h` file holds C in a C project and C++ in a C++ one, so the extension
+cannot settle which grammar to use. The C grammar is tried first; if it
+cannot parse the file, the C++ grammar is tried and the better fit wins.
+A C++ header named `.h` is therefore chunked as C++, while a genuine C
+header is never re-parsed.
+
+Structured configuration is chunked by its own shape rather than by blank lines:
+
+| Format | Extensions | How it is split |
+|--------|-----------|-----------------|
+| YAML | `.yaml`, `.yml` | Documents at `---`, then top-level keys, then recursively into any key still over budget. Nested chunks carry their key path (`spec.template.spec.containers[].env`). |
+| Helm template | `.tpl` | One chunk per `{{ define }}` block, named by the template it defines. |
+
+YAML is read as text, not parsed. Helm charts are Go templates that are not
+valid YAML until rendered, and they are the bulk of the `.yaml` in most
+repositories, so a real parser would reject the files that need this most.
 
 DITA XML documentation is also supported with XML-aware chunking:
 

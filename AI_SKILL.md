@@ -126,7 +126,7 @@ Contents:
 .index/
 ├── config.json            # User configuration
 ├── manifest.json          # File hash manifest (SHA-256)
-├── embedding_cache.json   # Content hash → vector cache
+├── embedding_cache.db     # Content hash → vector cache (SQLite)
 └── lancedb/               # LanceDB database directory
 ```
 
