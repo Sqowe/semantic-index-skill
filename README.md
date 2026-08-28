@@ -163,7 +163,7 @@ On first run, `build_index.py` creates `.index/config.json` in your project root
 | `chunking.overlap_tokens` | `50` | Overlap between adjacent chunks |
 | `chunking.min_tokens` | `20` | Minimum chunk size (smaller chunks are discarded) |
 | `indexing.file_extensions` | See config | Which file types to index |
-| `indexing.exclude_patterns` | See config | Patterns to skip (in addition to `.gitignore`) |
+| `indexing.exclude_patterns` | See config | Patterns to skip (in addition to `.gitignore`) — see [Exclusion Path Rules](#exclusion-path-rules) |
 | `indexing.max_file_size_kb` | `500` | Skip files larger than this |
 | `indexing.max_office_file_size_kb` | `50000` | Max file size for office documents (PDF/DOCX/PPTX) in KB |
 | `search.default_top_k` | `10` | Default number of search results |
@@ -185,9 +185,64 @@ Environment variables take precedence over config file values:
 | `SEMANTIC_INDEX_MODEL` | `embedding.model` |
 | `SEMANTIC_INDEX_DIMENSIONS` | `embedding.dimensions` |
 
+### Exclusion Path Rules
+
+`indexing.exclude_patterns` and `.indexignore` both use `.gitignore` syntax, and
+one rule in that syntax surprises people often enough to be worth stating plainly:
+
+> **A pattern containing a slash is anchored to the project root. A pattern
+> without one matches at any depth.**
+
+So `upgrade/` skips every `upgrade/` directory anywhere in the project, but
+`jenkins/custom-files/` skips only `<project-root>/jenkins/custom-files/` — not
+`eea4-rv/jenkins/custom-files/`. The pattern looks more specific and is in fact
+narrower than intended.
+
+| Pattern | `build/out.js` | `src/build/out.js` | `eea4-rv/jenkins/custom-files/v.yaml` |
+|---------|:---:|:---:|:---:|
+| `build/` | matches | matches | — |
+| `/build/` | matches | — | — |
+| `jenkins/custom-files/` | — | — | — |
+| `**/jenkins/custom-files/` | — | — | matches |
+| `custom-files/` | — | — | matches |
+
+To exclude a nested path wherever it appears, either prefix it with `**/` or
+name only its last segment:
+
+```json
+"exclude_patterns": [
+  "upgrade/",
+  "**/jenkins/custom-files/",
+  "grafana_dashboards/",
+  "/build/"
+]
+```
+
+`config.json` is strict JSON, so it takes no comments. Reading that example
+line by line: the first and third have no slash and so skip those directory
+names at any depth; the second is anchored but starts with `**/`, which
+restores "at any depth" explicitly; the fourth is anchored by its leading
+slash and skips only the `build/` directory at the project root.
+
+Other syntax behaves as in `.gitignore`: `*` matches within one path segment
+(`*.min.js`), `**` crosses segments (`docs/**`), and a trailing `/` restricts the
+match to directories.
+
+To check what a pattern actually covers, run a build and compare the reported
+file count, or search for a path you expected to be gone:
+
+```bash
+python semantic_search.py --project-dir . --query "some text from that directory"
+```
+
+If results still come back from a directory you excluded, the pattern is not
+matching — the anchoring rule above is the usual reason.
+
 ### .indexignore
 
-Create a `.indexignore` file in your project root to exclude additional paths (same syntax as `.gitignore`):
+Create a `.indexignore` file in your project root to exclude additional paths. Same
+syntax as `.gitignore`, and the same anchoring rule as above — a pattern with a
+slash in it is relative to the project root:
 
 ```
 tests/fixtures/
