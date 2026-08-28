@@ -11,6 +11,7 @@ description: >
   "how does Y work?" about their project. Also trigger when the user
   mentions "semantic search", "index my code", "embeddings", "vector search",
   or "codebase indexing".
+version: 0.2.0
 ---
 
 # Semantic Index

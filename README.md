@@ -1,5 +1,8 @@
 # Semantic Index Skill
 
+Version 0.2.0 — see [CHANGELOG.md](CHANGELOG.md) for what changed and what
+an upgrade from an earlier version requires.
+
 A portable SKILL for embedding-based indexing and semantic search of codebases and documentation. Designed for Claude Code, Cowork, and any SKILL-compatible AI tool.
 
 Instead of grep/glob for exact string matches, this skill lets you search code by meaning — queries like "where is authentication handled?" or "how does the payment flow work?" return the most relevant code and documentation chunks.

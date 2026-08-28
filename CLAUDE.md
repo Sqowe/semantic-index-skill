@@ -17,7 +17,10 @@ tool's skills folder and pointed at any project via `--project-dir`.
 1. [ARCHITECTURE.md](ARCHITECTURE.md) — system structure, components, stability zones.
 2. The relevant `AI_*.md` file(s) for the code you are touching — coding rules (see below).
 3. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — full implementation spec and phases.
-4. `docs/chats/` — previous implementation context and decisions, before touching anything
+4. [CHANGELOG.md](CHANGELOG.md) — what shipped in each version, and what an upgrade
+   from an earlier one requires. Add an entry under `## [Unreleased]` for any change
+   a user of the SKILL would notice.
+5. `docs/chats/` — previous implementation context and decisions, before touching anything
    with prior history there.
 
 ## Coding rules live in `AI_*.md` (do not duplicate them here or in ARCHITECTURE.md)
