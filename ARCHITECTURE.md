@@ -183,7 +183,8 @@ Defaults (`assets/default-config.json`) → `.index/config.json` (per-project) �
 ├── manifest.json          # SHA-256 file hash manifest
 ├── embedding_cache.db     # Content hash → vector cache (SQLite)
 ├── bm25_index.json        # BM25 keyword index
-└── lancedb/chunks.lance/  # LanceDB vector store (Arrow format)
+└── lancedb/chunks.lance/  # LanceDB vector store (Arrow format);
+                           # compacted at the end of each build
 ```
 
 ### Environment Variables
